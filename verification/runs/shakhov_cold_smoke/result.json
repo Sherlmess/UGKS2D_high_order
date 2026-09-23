@@ -1,0 +1,18 @@
+{
+  "case": "shakhov_cold_smoke",
+  "argv": [
+    "mpirun",
+    "-np",
+    "1",
+    "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/bin/ugks_solver"
+  ],
+  "cwd": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/runs/shakhov_cold_smoke",
+  "restart": null,
+  "timeout_s": 20,
+  "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+  "timed_out": false,
+  "exit_code": 0,
+  "wall_s": 0.444609083,
+  "final_sha256": "87d452286adf279bccc9a5a75aefef39263e862dbb8351f360ab59caa351395d",
+  "PASS": true
+}

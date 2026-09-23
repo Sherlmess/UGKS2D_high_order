@@ -1,0 +1,2 @@
+VARIABLES = iter, step_last, boundary_last, interp_last, evolution_last, update_last, mpi_last, output_last, total_last, step_pct, boundary_pct, interp_pct, evolution_pct, update_pct, mpi_pct, output_pct
+              1  0.0000000E+00  0.0000000E+00  0.3370000E-03  0.1146400E+00  0.4048400E-01  0.1300000E-03  0.0000000E+00  0.1555910E+00  0.0000000E+00  0.0000000E+00  0.2165935E+00  0.7368035E+02  0.2601950E+02  0.8355239E-01  0.0000000E+00

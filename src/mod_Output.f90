@@ -1,0 +1,853 @@
+
+module Output
+    use flow_data
+    use Flow_DIS
+    use Tools
+    use mpi
+    use mod_S2D1, only: IsS2CN2,IsS2Steady
+    use mod_S2NativeAdapter, only: S2NativeWriteOutput
+    implicit none
+    
+contains
+    !--------------------------------------------------
+    !>Write result
+    !--------------------------------------------------
+    subroutine Output_result()
+        if(IsS2CN2().or.IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
+            call S2NativeWriteOutput()
+            return
+        endif
+        if(Iflag_WriteSurf==1)      call write_wallboundary
+        call write_flow
+        if(Iflag_WriteRestart==1)   call write_restart
+    end subroutine Output_result
+    
+    
+    !---------------------------------------
+    !>Output flow field: conVars based
+    !---------------------------------------
+    subroutine write_flow
+        real(KREAL)                                     :: prim(4),prim0(4),solu0(10)
+        integer(KINT)                                   :: i,j,k,pi,pj,np_recv,i1,j1,Ndata,tag
+        character(len=20)                               :: str
+        real(KREAL), allocatable, dimension(:,:,:)      :: solution,solution_all
+        real(KREAL), allocatable, dimension(:,:,:)      :: buff1,buff2
+        real(KREAL), allocatable, dimension(:)        :: surfx,surfy
+        real(KREAL), allocatable, dimension(:,:)        :: FlowVars_all
+
+
+        !Flow variables to be output:
+        !1-10: density, u, v, T, p, txx, txy, tyy, qx, qy
+        !11-14: per-cell residuals of conservative variables
+        Ndata = 14
+        
+        !--------------------------------------------------
+        !Prepare solutions
+        !--------------------------------------------------
+        allocate(solution(1:nx,1:ny,Ndata))
+        if(Iflag_DIS==0) then       !Steady flow: output base flow: r0, u0, v0, T0, p0, sxx0,sxy0,syy0,qx0,qy0
+            do j=1,ny
+                do i=1,nx
+                    prim = GetPrimary(ctr(i,j)%conVars)
+                    solution(i,j,1:3)   = prim(1:3)                                                 !r,u,v
+                    solution(i,j,4)     = 1.0/prim(4)                                               !Temperature
+                    solution(i,j,5)     = 0.5*solution(i,j,1)*solution(i,j,4)                       !Pressure=0.5*rho*T
+                    !Evaluate macro output moments directly from flattened cell-center VDF views.
+                    solution(i,j,6:8)   = Get_Stress_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)      !Shear stress
+                    solution(i,j,9:10)  = GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)     !Heat flux
+                    solution(i,j,11:14) = ctr(i,j)%res_cell(1:4)                                      !Cell residual
+                end do
+            end do
+        elseif(Iflag_DIS==1) then   !Unsteady flow: output disturbance: r', u', v', T', p', sxx',sxy',syy',qx',qy'
+            do j=1,ny
+                do i=1,nx
+                    !Initial base flow
+                    prim0 = GetPrimary(ctr(i,j)%conVars0)
+                    solu0(1:3)   = prim0(1:3)                                               !r0,u0,v0
+                    solu0(4)     = 1.0/prim0(4)                                             !T0
+                    solu0(5)     = 0.5*solu0(1)*solu0(4)                                    !p0=0.5*r0*T0
+                    !Evaluate initial macro output moments from flattened initial VDF views.
+                    solu0(6:8)   = Get_Stress_Vec(ctr(i,j)%h0_vec,ctr(i,j)%b0_vec,prim0)  !sxx0,sxy0,syy0
+                    solu0(9:10)  = GetHeatFlux_Vec(ctr(i,j)%h0_vec,ctr(i,j)%b0_vec,prim0) !qx0,qy0
+                    
+                    prim = GetPrimary(ctr(i,j)%conVars)
+                    solution(i,j,1:3)   = prim(1:3)-solu0(1:3)                                              !r', u', v'
+                    solution(i,j,4)     = 1.0/prim(4)-solu0(4)                                              !T'
+                    !solution(i,j,5)     = 0.5*solution(i,j,1)*solution(i,j,4)-solu0(5)                      !p'
+                    solution(i,j,5)     = 0.5*prim(1)/prim(4)-solu0(5)                      
+                    !Subtract initial moments after evaluating the current flattened VDF views.
+                    solution(i,j,6:8)   = Get_Stress_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)-solu0(6:8)   !sxx',sxy',syy'
+                    solution(i,j,9:10)  = GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)-solu0(9:10) !qx',qy'
+                    solution(i,j,11:14) = ctr(i,j)%res_cell(1:4)                                              !Cell residual
+                end do
+            end do
+        endif
+
+        !Processor 0 gathers data from other processors
+        if(myid==0) then 
+            allocate(solution_all(Nx_all,Ny_all,Ndata))
+            do pj=0,NP_Y-1 
+                do pi=0,NP_X-1
+                    np_recv=pj*NP_X+pi
+                    if(np_recv.eq.0) then
+                        do j1=1,ny
+                            do i1=1,nx
+                                solution_all(i1,j1,1:Ndata) = solution(i1,j1,1:Ndata)
+                            enddo
+                        enddo
+                    else
+                        allocate(buff1(Block_XY(np_recv)%NI,Block_XY(np_recv)%NJ,Ndata))
+                        tag=np_recv     !tag equals to block index
+                        call MPI_Recv(buff1,Block_XY(np_recv)%NI*Block_XY(np_recv)%NJ*Ndata,MPI_KREAL,np_recv,tag,MPI_COMM_WORLD,Status,ierr)
+                        do j1=1,Block_XY(np_recv)%NJ
+                            do i1=1,Block_XY(np_recv)%NI
+                                i=Block_XY(np_recv)%Origin_I+i1-1
+                                j=Block_XY(np_recv)%Origin_J+j1-1
+                                solution_all(i,j,1:Ndata)=buff1(i1,j1,1:Ndata)
+                            enddo
+                        enddo
+                        deallocate(buff1)
+                    endif
+                enddo
+            enddo
+        else
+            allocate(buff2(nx,ny,Ndata))
+            tag=IP_Y*NP_X+IP_X      !tag equals to block index
+            do j1=1,ny
+                do i1=1,nx
+                    buff2(i1,j1,1:Ndata)=solution(i1,j1,1:Ndata)
+                enddo
+            enddo
+            call MPI_Send(buff2,nx*ny*Ndata,MPI_KREAL,0,tag,MPI_COMM_WORLD,ierr)
+            deallocate(buff2)
+        endif
+        
+        deallocate(solution)
+        call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        
+        !--------------------------------------------------
+        !Write to file
+        !--------------------------------------------------
+        if(myID==0) then
+            !-------------------------------------------
+            !>Output gener flow field
+            !-------------------------------------------
+            write(str , *) iter
+            !====unformatted file
+            !call write_wallboundary
+            allocate(surfx(nx_all),surfy(nx_all),FlowVars_all(nx_all,5))
+            open(1,file='surf.dat',form='unformatted')
+            read(1) 
+            read(1) (surfx(i),i=1,nx_all),(surfy(i),i=1,nx_all),(FlowVars_all(i,1:5),i=1,nx_all)
+            close(1)
+
+        open(1,file='grid.grd',form='unformatted')
+            write(1) 1
+            write(1) nx_all,ny_all+1
+            write(1) (0.5*(gridx_all(i,1)+gridx_all(i+1,1)),i=1,nx_all),((gridxc_all(i,j),i=1,nx_all),j=1,ny_all),(0.5*(gridy_all(i,1)+gridy_all(i+1,1)),i=1,nx_all),((gridyc_all(i,j),i=1,nx_all),j=1,ny_all)
+			!((gridxc_all(i,j),i=1,nx_all),j=1,ny_all),((gridyc_all(i,j),i=1,nx_all),j=1,ny_all)
+            close(1)
+
+        open(1,file='grid_new.grd',form='unformatted')
+            write(1) 1
+            write(1) nx_all,ny_all+1
+            write(1) (0.5*(gridx_all(i,1)+gridx_all(i+1,1)),i=1,nx_all),((gridxc_all(i,j),i=1,nx_all),j=1,ny_all),((0.5*(gridy_all(i,j)+gridy_all(i+1,j)),i=1,nx_all),j=1,ny_all+1)
+			!((gridxc_all(i,j),i=1,nx_all),j=1,ny_all),((gridyc_all(i,j),i=1,nx_all),j=1,ny_all)
+            close(1)
+
+            open(1,file='uvw2D.dat',form='unformatted')
+            write(1) 1
+            write(1) nx_all,ny_all+1,1,6
+            write(1) (FlowVars_all(i,1),i=1,nx_all),(((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=1,1),&
+            (FlowVars_all(i,2)/Ma*sqrt(2.d0/gamma),i=1,nx_all),(((solution_all(i,j,k)/Ma*sqrt(2.d0/gamma),i=1,nx_all),j=1,ny_all),k=2,2),&
+            (FlowVars_all(i,3)/Ma*sqrt(2.d0/gamma),i=1,nx_all),(((solution_all(i,j,k)/Ma*sqrt(2.d0/gamma),i=1,nx_all),j=1,ny_all),k=3,3),&
+            (0.d0,i=1,nx_all),((0.d0,i=1,nx_all),j=1,ny_all),&
+            (FlowVars_all(i,4),i=1,nx_all),(((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=4,4),&
+            (FlowVars_all(i,5)/Ma**2*2.d0/gamma,i=1,nx_all),(((solution_all(i,j,k)/Ma**2*2.d0/gamma,i=1,nx_all),j=1,ny_all),k=5,5)
+            !(((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=1,1),(((solution_all(i,j,k)/Ma*sqrt(2.d0/gamma),i=1,nx_all),j=1,ny_all),k=2,2),&
+            !(((solution_all(i,j,k)/Ma*sqrt(2.d0/gamma),i=1,nx_all),j=1,ny_all),k=3,3),((0.d0,i=1,nx_all),j=1,ny_all),&
+            !(((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=4,4),(((solution_all(i,j,k)/Ma**2*2.d0/gamma,i=1,nx_all),j=1,ny_all),k=5,5)
+            close(1)
+            deallocate(surfx,surfy,FlowVars_all)
+            !open(1,file='Flow2d'//trim(fileName)//'_'//trim(adjustl(str))//'.dat',form='unformatted')
+            !write(1) 1
+            !write(1) nx_all,ny_all
+            !write(1) (((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=1,5)
+            !close(1)
+            
+            !open(1,file='Flow2d.dat',form='unformatted')
+            !write(1) 1
+            !write(1) nx_all,ny_all
+            !write(1) (((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=1,5)
+            !close(1)
+            
+            !====formatted file
+            !history file: cell-centered form
+            !open(1,file='Flow2dC'//trim(fileName)//'_'//trim(adjustl(str))//'.plt')
+            open(1,file='Flow2dC.plt')
+            write(1,*) "VARIABLES = x, y, r, u, v, T, p, sxx, sxy, syy, qx, qy"
+            write(1,*) "ZONE  I = ",nx_all-1+2,", J = ",ny_all-1+2,"DATAPACKING=BLOCK, VARLOCATION=([3-12]=CELLCENTERED)"
+            write(1,*) ((gridx_all(i,j),i=1,nx_all+1),j=1,ny_all+1),((gridy_all(i,j),i=1,nx_all+1),j=1,ny_all+1), &
+                       (((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=1,10)
+            close(1)
+
+            !final result (restart file): cell center value and point form
+            !open(1,file='Flow2d.plt')
+            open(1,file='Flow2d_'//trim(adjustl(str))//'.plt')
+            write(1,*) "VARIABLES = x, y, r, u, v, T, p, sxx, sxy, syy, qx, qy"
+            write(1,'(a20,I8,a20,I8,a20)') "ZONE  I = ",nx_all-1+1,", J = ",ny_all-1+1,", DATAPACKING=BLOCK"
+            write(1,*) ((gridxc_all(i,j),i=1,nx_all),j=1,ny_all),((gridyc_all(i,j),i=1,nx_all),j=1,ny_all), &
+                       (((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=1,10)
+            close(1)
+
+            !Per-cell residual cloud (4 conservative components)
+            open(1,file='Residual2d_'//trim(adjustl(str))//'.plt')
+            write(1,*) "VARIABLES = x, y, resRho, resRhoU, resRhoV, resE, logResRho, logResRhoU, logResRhoV, logResE"
+            write(1,'(a20,I8,a20,I8,a20)') "ZONE  I = ",nx_all,", J = ",ny_all,", DATAPACKING=BLOCK"
+            write(1,*) ((gridxc_all(i,j),i=1,nx_all),j=1,ny_all),((gridyc_all(i,j),i=1,nx_all),j=1,ny_all), &
+                       (((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=11,14), &
+                       (((log10(max(solution_all(i,j,k),SMV)),i=1,nx_all),j=1,ny_all),k=11,14)
+            close(1)
+            
+            !-------------------------------------------
+            !>Output specified line for some geometries
+            !-------------------------------------------
+            !=====Write wall-normal profile for Couette flow
+            !mid = (1+nx_all)/2
+            !open(1,file='profile.plt')
+            !write(1,*) 'variables=y,density,u,v,T,p,txx,txy,tyy,qx,qy'
+            !do j=1,ny_all
+            !    write(1,'(11e24.16)') gridyc_all(mid,j),(solution_all(mid,j,i),i=1,10)
+            !enddo
+            !close(1)
+            
+            !=====Write central line profile for Cavity
+            !mid = (1+nx_all)/2
+            !open(unit=1,file='Y-U.plt',status="replace",action="write")
+            !do j=1,ny_all
+            !    write(1,*)  gridyc_all(mid,j),solution_all(mid,j,2)/0.15
+            !end do
+            !close(1)
+            !
+            !mid = (1+ny_all)/2
+            !open(unit=1,file='X-V.plt',status="replace",action="write")
+            !do i=1,nx_all
+            !    write(1,*)  gridxc_all(i,mid),solution_all(i,mid,3)/0.15
+            !end do
+            !close(1)
+            
+            deallocate(solution_all)
+        endif
+        
+    end subroutine write_flow
+    
+    !-------------------------------------------------------------------
+    !>Output velocity distribution function for a cell
+    !-------------------------------------------------------------------
+    subroutine write_microVDF(i0,j0)
+        integer,intent(in)      :: i0,j0        !index in global mesh
+        integer(KINT)           :: i,j,k,np,is,js,ib,jb,np_recv,Ndata
+        real(KREAL),allocatable :: buff1(:,:),buff2(:,:) !Micro VDF MPI buffers flattened as (Nvel,Ndata)
+        real(KREAL)             :: fcx(Nu),fcy(Nv)
+        
+        !search (i0,j0) in which block
+        np_recv = -1
+        do np=0,NP_XY-1
+            is=Block_XY(np)%Origin_I; js=Block_XY(np)%Origin_J
+            if( is<=i0 .and. i0<=(is+Block_XY(np)%NI-1) .and. js<=j0 .and. j0<=(js+Block_XY(np)%NJ-1) ) then
+                np_recv = np
+                ib      = i0-Block_XY(np)%Origin_I+1
+                jb      = j0-Block_XY(np)%Origin_J+1
+                exit
+            endif
+        enddo
+        if (np_recv == -1) then
+            write(*,*) 'write_microVDF: target cell not found for (i0,j0)=', i0, j0
+            return
+        endif
+        
+        Ndata = 2
+        
+        !============================================================
+        ! Root Process: Gather and Write Data
+        !============================================================
+        if(myID==0) then
+            
+            ! >>>>> Branch A: Unstructured Grid <<<<<
+            if (Quadrature_method == Quad_Unstruct) then
+                allocate(buff1(Nvel,Ndata))
+                
+                if (myID == np_recv) then
+                    !Copy target unstructured VDF through flattened cell-center views.
+                    buff1(1:Nvel,1) = ctr(ib,jb)%h_vec(1:Nvel)
+                    buff1(1:Nvel,2) = ctr(ib,jb)%b_vec(1:Nvel)
+                else
+                    call MPI_Recv(buff1,Nvel*Ndata,MPI_KREAL,np_recv,5000,MPI_COMM_WORLD,Status,ierr)
+                endif
+                
+                open(1,file='VDF_Python.dat')
+                ! Header
+                write(1,'(A)') 'VARIABLES = "u", "v", "weight", "h", "b"'
+                write(1,'(A)') 'ZONE T="Unstruct VDF"'
+                
+                do k=1,Nvel
+                    write(1,'(5E16.8)') uSpace(k), vSpace(k), weight(k), buff1(k,1), buff1(k,2)
+                enddo
+                close(1)
+                
+                write(*,*) 'VDF data exported to VDF_Python.dat for Python processing.'
+
+            ! >>>>> Branch B: Structured Grid <<<<<
+            else
+                allocate(buff1(Nvel,Ndata))
+                
+                if (myID == np_recv) then
+                    !Copy target structured VDF through flattened cell-center views.
+                    buff1(1:Nvel,1) = ctr(ib,jb)%h_vec(1:Nvel)
+                    buff1(1:Nvel,2) = ctr(ib,jb)%b_vec(1:Nvel)
+                else
+                    call MPI_Recv(buff1,Nvel*Ndata,MPI_KREAL,np_recv,5000,MPI_COMM_WORLD,Status,ierr)
+                endif
+                
+                ! Calculate Marginal Distribution fcx, fcy
+                fcx = 0; fcy = 0
+                do i=1,Nu
+                    do j=1,Nv-1
+                        fcx(i) = fcx(i) + 0.5*(vspace(i+j*Nu)-vspace(i+(j-1)*Nu))*(buff1(i+j*Nu,1)+buff1(i+(j-1)*Nu,1))
+                    enddo
+                enddo
+                if (sum(fcx) > 1.0e-16) fcx = fcx/sum(fcx)
+                
+                do j=1,Nv
+                    do i=1,Nu-1
+                        fcy(j) = fcy(j) + 0.5*(uspace(i+1+(j-1)*Nu)-uspace(i+(j-1)*Nu))*(buff1(i+1+(j-1)*Nu,1)+buff1(i+(j-1)*Nu,1))
+                    enddo
+                enddo
+                if (sum(fcy) > 1.0e-16) fcy = fcy/sum(fcy)
+                    
+                ! Output Field
+                open(1,file='VDF_Field.plt')
+                write(1,'(a)') "VARIABLES = cx, cy, h, b"
+                write(1,'(a20,I8,a20,I8,a20)') "ZONE  I = ",Nu,", J = ",Nv,", DATAPACKING=BLOCK"
+                write(1,*) ((uspace(i+(j-1)*Nu),i=1,Nu),j=1,Nv),((vspace(i+(j-1)*Nu),i=1,Nu),j=1,Nv),&
+                           (((buff1(i+(j-1)*Nu,k),i=1,Nu),j=1,Nv),k=1,Ndata)
+                close(1) 
+                
+                ! Output Lines
+                open(1,file='VDF.plt')
+                write(1,'(a)') "VARIABLES = c, f"
+                write(1,*) 'Zone T=fcx, I=',Nu
+                do i=1,Nu
+                    write(1,*) uspace(i),fcx(i)
+                enddo
+                write(1,*) 'Zone T=fcy, I=',Nv
+                do j=1,Nv
+                    write(1,*) vspace(1+(j-1)*Nu),fcy(j)
+                enddo
+                close(1)
+            endif
+            
+            if (allocated(buff1)) deallocate(buff1)
+
+        !============================================================
+        ! Sending Process (If not Root)
+        !============================================================
+        elseif(myID==np_recv) then
+            allocate(buff2(Nvel,Ndata))
+            !Copy target VDF through flattened cell-center views before sending to root.
+            buff2(1:Nvel,1) = ctr(ib,jb)%h_vec(1:Nvel)
+            buff2(1:Nvel,2) = ctr(ib,jb)%b_vec(1:Nvel)
+            call MPI_Send(buff2,Nvel*Ndata,MPI_KREAL,0,5000,MPI_COMM_WORLD,ierr)
+            deallocate(buff2)
+        endif
+        
+    end subroutine write_microVDF
+    
+    
+    !-------------------------------------------------------------------
+    !>Output surface surface flowVars and aerodynamics
+    !-------------------------------------------------------------------
+    !The surface quantities has been computed in the CalFluxBoundary, here only output BoundaryFace(3)
+    subroutine write_wallboundary
+        integer(KINT)                                   :: i,pi,i1,np_recv,Ndata
+        real(KREAL)                                     :: pinf
+        real(KREAL), allocatable, dimension(:,:)        :: FlowVars,FlowVars_all         !rho,vn,vt,T,p,shxx,shxy,shyy,qx,qy (by interface distribution) 
+        real(KREAL), allocatable, dimension(:,:)        :: Aerodynamics,Aerodynamics_all !p_wall, tau_wall, qn_wall (by particle-surface collision)
+        real(KREAL), allocatable, dimension(:,:)        :: buff1,buff2
+        
+        !Only the bottom boundary is post-processed; other boundary can be treated in the same way
+        if(bc_type(3)==BCconst_wall_isothermal) then    !bottom boundary
+            !assign surface quantities
+            allocate(FlowVars(nx,5),Aerodynamics(nx,3))
+            if(Iflag_DIS==0) then
+                do i=1,nx
+                    FlowVars(i,1:5)        = hface(i,1)%FlowVars(1:5)
+                    Aerodynamics(i,1:3)     = hface(i,1)%Aerodynamics(1:3)
+                end do
+            elseif(Iflag_DIS==1) then
+                do i=1,nx
+                    FlowVars(i,1:5)        = hface(i,1)%FlowVars(1:5)-hface(i,1)%FlowVars0(1:5)
+                    Aerodynamics(i,1:3)     = hface(i,1)%Aerodynamics(1:3)-hface(i,1)%Aerodynamics0(1:3)
+                end do
+            endif
+            
+            !Processor 0 gathers all data
+            Ndata = 8           !MPI_Sendrecv: FlowVars(1:10), Aerodynamics(1:3)
+            if(myid==0) then  
+                allocate(FlowVars_all(nx_all,5),Aerodynamics_all(nx_all,3))
+                do pi=0,NP_X-1
+                    np_recv=pi
+                    if(np_recv.eq.0) then
+                        do i1=1,nx
+                            FlowVars_all(i1,1:5)        = FlowVars(i1,1:5)
+                            Aerodynamics_all(i1,1:3)    = Aerodynamics(i1,1:3)
+                        enddo
+                    else
+                        allocate(buff1(Block_XY(np_recv)%NI,Ndata))
+                        call MPI_Recv(buff1,Block_XY(np_recv)%NI*Ndata,MPI_KREAL,np_recv,8000,MPI_COMM_WORLD,Status,ierr)
+                        do i1=1,Block_XY(np_recv)%NI
+                            i=Block_XY(np_recv)%Origin_I+i1-1
+                            FlowVars_all(i,1:5)     = buff1(i1,1:5)
+                            Aerodynamics_all(i,1:3) = buff1(i1,6:8)
+                        enddo
+                        deallocate(buff1)
+                    endif
+                enddo
+            elseif(myid/=0 .and. IP_Y==0) then
+                allocate(buff2(nx,Ndata))
+                do i1=1,nx
+                    buff2(i1,1:5)   = FlowVars(i1,1:5)
+                    buff2(i1,6:8)   = Aerodynamics(i1,1:3)
+                enddo
+                call MPI_Send(buff2,nx*Ndata,MPI_KREAL,0,8000,MPI_COMM_WORLD,ierr)
+                deallocate(buff2)
+            endif
+            deallocate(FlowVars,Aerodynamics)
+            
+            call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+                
+            !write to file
+            if(myID==0) then
+                !!Output surface flow variables
+                !open(1,file='Surf_FlowVars.plt')
+                !write(1,'(a)') 'variables=x,y,density,u,v,T,p'
+                !do i=1,nx_all
+                !    write(1,'(7e16.6)') 0.5*(gridx_all(i,1)+gridx_all(i+1,1)),0.5*(gridy_all(i,1)+gridy_all(i+1,1)),FlowVars_all(i,1:5)
+                !end do   
+                !close(1)
+                !    
+                !!Output surface aerodynamics
+                !open(1,file='Surf_Aerodynamics.plt')
+                !write(1,'(a)') 'variables=x,y,pnn,pnt,qn'
+                !do i=1,nx_all
+                !    write(1,'(5e16.6)') 0.5*(gridx_all(i,1)+gridx_all(i+1,1)),0.5*(gridy_all(i,1)+gridy_all(i+1,1)),Aerodynamics_all(i,1:3)
+                !enddo
+                !close(1)
+                
+                !Output surface quantities
+                open(1,file='Surf.plt')
+                write(1,'(a)') 'variables=x,y,density,u,v,T,p,pnn_w,pnt_w,qn_w'
+                do i=1,nx_all
+                    write(1,'(10e16.6)') 0.5*(gridx_all(i,1)+gridx_all(i+1,1)),0.5*(gridy_all(i,1)+gridy_all(i+1,1)), &
+                                        FlowVars_all(i,1:5), Aerodynamics_all(i,1:3)
+                end do   
+                close(1)
+                
+        open(1,file='surf.dat',form='unformatted')
+                    write(1) nx_all,7
+                    write(1) (0.5*(gridx_all(i,1)+gridx_all(i+1,1)),i=1,nx_all),(0.5*(gridy_all(i,1)+gridy_all(i+1,1)),i=1,nx_all),(FlowVars_all(i,1:5),i=1,nx_all)
+                    close(1)
+
+    
+                !Output surface coefficients for external flow
+                pinf = 0.5*Prim_inf(1)/Prim_inf(4)          !p=0.5*rho*T
+                open(1,file='Surf_CpCfCh.plt')
+                write(1,'(a)') 'variables=x,y,Cp,Cf,Ch'
+                do i=1,nx_all
+                    write(1,'(5es24.16)') 0.5*(gridx_all(i,1)+gridx_all(i+1,1)),  0.5*(gridy_all(i,1)+gridy_all(i+1,1)),&
+                                        (Aerodynamics_all(i,1)-pinf)/(0.25*gamma*Ma**2), &  !surface pressure coefficient
+                                        Aerodynamics_all(i,2)/(0.25*gamma*Ma**2), &         !skin friction coefficient
+                                        -Aerodynamics_all(i,3)*2.0*(2.0/gamma)**1.5/Ma**3   !surface heat flux coefficient
+                enddo
+                close(1)
+                deallocate(FlowVars_all,Aerodynamics_all)
+            endif
+        endif
+    
+    end subroutine write_wallboundary
+    
+
+    !-------------------------------------------------------------------
+    !>Write restart file, including: grid2d.grd, flow2d.dat, and vdf2d.dat (single-block)
+    !>Logic Updated: 
+    !>  - Main VDF: Unstruct -> vdf2d_unstruct_full.dat (h only)
+    !>  - Pert VDF: Unstruct -> vdf2d_unstruct_full_pert.dat (h' only)
+    !-------------------------------------------------------------------
+    subroutine write_restart
+        integer(KINT)                                   :: i,j,k,l,m,pi,pj,np_recv,i1,j1,Ndata,tag
+        integer(KINT)                                   :: flat_k !Flattened velocity-space index for VDF output copies
+        real(KREAL), allocatable, dimension(:,:,:)      :: solution,solution_all
+        real(KREAL), allocatable, dimension(:,:,:)      :: buff1,buff2
+        real(KREAL), allocatable, dimension(:,:,:,:)    :: solution_vdf,solution_vdf_all !Structured restart VDF cache with flat Nvel velocity dimension
+        real(KREAL), allocatable, dimension(:,:,:,:)    :: buff1_vdf,buff2_vdf !Structured restart MPI buffers with flat Nvel velocity dimension
+        ! perturbation VDF containers (h' and b')
+        real(KREAL), allocatable, dimension(:,:,:,:)    :: solution_vdf_pert,solution_vdf_pert_all !Structured perturbation VDF cache with flat Nvel velocity dimension
+        real(KREAL), allocatable, dimension(:,:,:,:)    :: buff1_vdf_pert,buff2_vdf_pert !Structured perturbation MPI buffers with flat Nvel velocity dimension
+        ! Unstructured Grid VDF Variables
+        ! For Main VDF (h)
+        real(KREAL), allocatable, dimension(:,:,:,:) :: buff_vdf_local  !Unstructured VDF cache stored as (nx, ny, Nvel, 2)
+        real(KREAL), allocatable, dimension(:,:,:,:) :: buff_vdf_all    !Global unstructured VDF cache stored as (Nx_all, Ny_all, Nvel, 2)
+        real(KREAL), allocatable, dimension(:,:,:,:)    :: buff_vdf_pert_local  !Local perturbation VDF cache stored as (NI, NJ, Nvel, 2)
+        real(KREAL), allocatable, dimension(:,:,:,:)    :: buff_vdf_pert_all    !Global perturbation VDF cache stored as (Nx_all, Ny_all, Nvel, 2)
+        real(KREAL), allocatable, dimension(:,:,:,:)      :: recv_buffer   ! Shared temp buffer
+            
+        !---------------------------------------------------------------------
+        !>Write grid: grid2d.grd
+        !---This file will not be read when restart, but for visualization and interpolation
+        !---------------------------------------------------------------------
+        if(myid==0) then
+            open(1,file='grid2d.grd',form='unformatted')
+            write(1) 1
+            write(1) nx_all,ny_all
+            write(1) ((gridxc_all(i,j),i=1,nx_all),j=1,ny_all),((gridyc_all(i,j),i=1,nx_all),j=1,ny_all)
+            close(1)
+        endif
+
+            
+        !---------------------------------------------------------------------
+        !>Write macro-conserved variables: flow2d.dat-->ctr(:,:)%conVars(1:4)
+        !---------------------------------------------------------------------
+        Ndata = 4
+        
+        !--prepare solution
+        allocate(solution(1:nx,1:ny,Ndata))
+        do j=1,ny
+            do i=1,nx
+                solution(i,j,1:4)   = ctr(i,j)%conVars
+            end do
+        end do
+
+        !--processor 0 gathers data from other processors
+        if(myid==0) then 
+            allocate(solution_all(Nx_all,Ny_all,Ndata))
+            do pj=0,NP_Y-1 
+                do pi=0,NP_X-1
+                    np_recv=pj*NP_X+pi
+                    if(np_recv.eq.0) then
+                        do j1=1,ny
+                            do i1=1,nx
+                                solution_all(i1,j1,1:Ndata) = solution(i1,j1,1:Ndata)
+                            enddo
+                        enddo
+                    else
+                        allocate(buff1(Block_XY(np_recv)%NI,Block_XY(np_recv)%NJ,Ndata))
+                        tag=np_recv     !tag equals to block index
+                        call MPI_Recv(buff1,Block_XY(np_recv)%NI*Block_XY(np_recv)%NJ*Ndata,MPI_KREAL,np_recv,tag,MPI_COMM_WORLD,Status,ierr)
+                        do j1=1,Block_XY(np_recv)%NJ
+                            do i1=1,Block_XY(np_recv)%NI
+                                i=Block_XY(np_recv)%Origin_I+i1-1
+                                j=Block_XY(np_recv)%Origin_J+j1-1
+                                solution_all(i,j,1:Ndata)=buff1(i1,j1,1:Ndata)
+                            enddo
+                        enddo
+                        deallocate(buff1)
+                    endif
+                enddo
+            enddo
+        else
+            allocate(buff2(nx,ny,Ndata))
+            tag=IP_Y*NP_X+IP_X      !tag equals to block index
+            do j1=1,ny
+                do i1=1,nx
+                    buff2(i1,j1,1:Ndata)=solution(i1,j1,1:Ndata)
+                enddo
+            enddo
+            call MPI_Send(buff2,nx*ny*Ndata,MPI_KREAL,0,tag,MPI_COMM_WORLD,ierr)
+            deallocate(buff2)
+        endif
+        deallocate(solution)
+        call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        
+        !--write to file
+        if(myid==0) then
+            open(1,file='flow2d.dat',form='unformatted')
+            write(1) 1
+            write(1) nx_all,ny_all,Ndata
+            write(1) (((solution_all(i,j,k),i=1,nx_all),j=1,ny_all),k=1,Ndata)
+            close(1)
+            deallocate(solution_all)
+        endif
+            
+            
+        !=====================================================================
+        !> SECTION 1: Main VDF Output (h)
+        !=====================================================================
+        
+        !>>> BRANCH A: Unstructured (Optimized) <<<
+        if (Quadrature_method == Quad_Unstruct) then
+            
+            allocate(buff_vdf_local(nx, ny, Nvel, 2))
+            do j = 1, ny
+                do i = 1, nx
+                    !Copy unstructured VDFs through flattened cell-center views.
+                    do k=1,Nvel
+                        buff_vdf_local(i, j, k, 1) = ctr(i, j)%h_vec(k)
+                        buff_vdf_local(i, j, k, 2) = ctr(i, j)%b_vec(k)
+                    enddo
+                end do
+            end do
+            if (myid == 0) then
+                allocate(buff_vdf_all(Nx_all, Ny_all, Nvel, 2))
+                do pj = 0, NP_Y - 1
+                    do pi = 0, NP_X - 1
+                        np_recv = pj * NP_X + pi
+                        if (np_recv == 0) then
+                            do j1 = 1, ny
+                                do i1 = 1, nx
+                                    buff_vdf_all(i1, j1, :, :) = buff_vdf_local(i1, j1, :, :)
+                                end do
+                            end do
+                        else
+                            allocate(recv_buffer(Block_XY(np_recv)%NI, Block_XY(np_recv)%NJ, Nvel, 2))
+                            tag = np_recv * 20 
+                            call MPI_Recv(recv_buffer, Block_XY(np_recv)%NI * Block_XY(np_recv)%NJ * Nvel * 2, &
+                                          MPI_KREAL, np_recv, tag, MPI_COMM_WORLD, Status, ierr)
+                            do j1 = 1, Block_XY(np_recv)%NJ
+                                do i1 = 1, Block_XY(np_recv)%NI
+                                    i = Block_XY(np_recv)%Origin_I + i1 - 1
+                                    j = Block_XY(np_recv)%Origin_J + j1 - 1
+                                    buff_vdf_all(i, j, :, :) = recv_buffer(i1, j1, :, :)
+                                end do
+                            end do
+                            deallocate(recv_buffer)
+                        endif
+                    end do
+                end do
+            else
+                tag = (IP_Y * NP_X + IP_X) * 20
+                call MPI_Send(buff_vdf_local, nx * ny * Nvel * 2, MPI_KREAL, 0, tag, MPI_COMM_WORLD, ierr)
+            endif
+            deallocate(buff_vdf_local)
+            call MPI_BARRIER(MPI_COMM_WORLD, ierr)
+
+            if (myid == 0) then
+                open(1, file='vdf2d_unstruct_full.dat', form='unformatted')
+                write(1) Nx_all, Ny_all, Nvel, 1
+                write(1) (uSpace(k), k=1,Nvel), (vSpace(k), k=1,Nvel), (weight(k), k=1,Nvel)
+                write(1) buff_vdf_all
+                close(1)
+                deallocate(buff_vdf_all)
+            endif
+
+        !>>> BRANCH B: Structured (Standard) <<<
+        else 
+            Ndata = 2
+            allocate(solution_vdf(nx,ny,Nvel,Ndata))
+            do j=1,ny
+                do i=1,nx
+                    !Copy structured VDFs through flattened cell-center views.
+                    do flat_k=1,Nvel
+                        solution_vdf(i,j,flat_k,1) = ctr(i,j)%h_vec(flat_k)
+                        solution_vdf(i,j,flat_k,2) = ctr(i,j)%b_vec(flat_k)
+                    enddo
+                end do
+            end do
+            
+            if(myid==0) then 
+                allocate(solution_vdf_all(Nx_all,Ny_all,Nvel,Ndata))
+                do pj=0,NP_Y-1 
+                    do pi=0,NP_X-1
+                        np_recv=pj*NP_X+pi
+                        if(np_recv.eq.0) then
+                            do j1=1,ny
+                                do i1=1,nx
+                                    solution_vdf_all(i1,j1,1:Nvel,1:Ndata) = solution_vdf(i1,j1,1:Nvel,1:Ndata)
+                                enddo
+                            enddo
+                        else
+                            allocate(buff1_vdf(Block_XY(np_recv)%NI,Block_XY(np_recv)%NJ,Nvel,Ndata))
+                            tag=np_recv*10 
+                            call MPI_Recv(buff1_vdf,Block_XY(np_recv)%NI*Block_XY(np_recv)%NJ*Nvel*Ndata, &
+                                          MPI_KREAL,np_recv,tag,MPI_COMM_WORLD,Status,ierr)
+                            do j1=1,Block_XY(np_recv)%NJ
+                                do i1=1,Block_XY(np_recv)%NI
+                                    i=Block_XY(np_recv)%Origin_I+i1-1
+                                    j=Block_XY(np_recv)%Origin_J+j1-1
+                                    solution_vdf_all(i,j,1:Nvel,1:Ndata)=buff1_vdf(i1,j1,1:Nvel,1:Ndata)
+                                enddo
+                            enddo
+                            deallocate(buff1_vdf)
+                        endif
+                    enddo
+                enddo
+            else
+                allocate(buff2_vdf(nx,ny,Nvel,Ndata))
+                tag=(IP_Y*NP_X+IP_X)*10 
+                do j1=1,ny
+                    do i1=1,nx
+                        buff2_vdf(i1,j1,1:Nvel,1:Ndata)=solution_vdf(i1,j1,1:Nvel,1:Ndata)
+                    enddo
+                enddo
+                call MPI_Send(buff2_vdf,nx*ny*Nvel*Ndata,MPI_KREAL,0,tag,MPI_COMM_WORLD,ierr)
+                deallocate(buff2_vdf)
+            endif
+            deallocate(solution_vdf)
+            call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+            
+            if(myid==0) then
+                open(1,file='vdf2d.dat',form='unformatted')
+                write(1) 1
+                write(1) nx_all,ny_all,Nvel*Ndata
+                write(1) ((((solution_vdf_all(i,j,flat_k,k),i=1,nx_all),j=1,ny_all),flat_k=1,Nvel),k=1,Ndata)
+                close(1)
+                deallocate(solution_vdf_all)
+            endif
+        endif    
+            
+        !=====================================================================
+        !> SECTION 2: Perturbation Output (Only if Iflag_DIS == 1)
+        !=====================================================================
+        if (Iflag_DIS == 1) then
+            
+            !>>> BRANCH A: Unstructured Perturbation (h' only) <<<
+            if (Quadrature_method == Quad_Unstruct) then
+                
+                ! 1. Calculate Local Perturbation h' = h - h0
+                
+                Ndata = 2
+
+                allocate(buff_vdf_pert_local(nx, ny, Nvel, Ndata))
+                do j = 1, ny
+                    do i = 1, nx
+                        !Calculate unstructured perturbation VDFs through flattened cell-center views.
+                        do k=1,Nvel
+                            buff_vdf_pert_local(i, j, k, 1) = ctr(i, j)%h_vec(k)-ctr(i, j)%h0_vec(k)
+                            buff_vdf_pert_local(i, j, k, 2) = ctr(i, j)%b_vec(k)-ctr(i, j)%b0_vec(k)
+                        enddo
+                    end do
+                end do
+
+                ! 2. MPI Gather (Use tag + 1 logic to avoid collision with Main VDF)
+                if (myid == 0) then
+                    allocate(buff_vdf_pert_all(Nx_all, Ny_all, Nvel, Ndata))
+                    
+                    do pj = 0, NP_Y - 1
+                        do pi = 0, NP_X - 1
+                            np_recv = pj * NP_X + pi
+                            
+                            if (np_recv == 0) then
+                                do j1 = 1, ny
+                                    do i1 = 1, nx
+                                        buff_vdf_pert_all(i1, j1, :, :) = buff_vdf_pert_local(i1, j1, :, :)
+                                    end do
+                                end do
+                            else
+                                allocate(recv_buffer(Block_XY(np_recv)%NI, Block_XY(np_recv)%NJ, Nvel, Ndata))
+                                tag = np_recv * 20 + 1   !Base tag + 1 for perturbation
+                                
+                                call MPI_Recv(recv_buffer, Block_XY(np_recv)%NI * Block_XY(np_recv)%NJ * Nvel * Ndata, &
+                                              MPI_KREAL, np_recv, tag, MPI_COMM_WORLD, Status, ierr)
+                                
+                                do j1 = 1, Block_XY(np_recv)%NJ
+                                    do i1 = 1, Block_XY(np_recv)%NI
+                                        i = Block_XY(np_recv)%Origin_I + i1 - 1
+                                        j = Block_XY(np_recv)%Origin_J + j1 - 1
+                                        buff_vdf_pert_all(i, j, :, :) = recv_buffer(i1, j1, :, :)
+                                    end do
+                                end do
+                                deallocate(recv_buffer)
+                            endif
+                        end do
+                    end do
+                else
+                    ! Send
+                    tag = (IP_Y * NP_X + IP_X) * 20 + 1
+                    call MPI_Send(buff_vdf_pert_local, nx * ny * Nvel * Ndata, MPI_KREAL, 0, tag, MPI_COMM_WORLD, ierr)
+                endif
+                
+                deallocate(buff_vdf_pert_local)
+                call MPI_BARRIER(MPI_COMM_WORLD, ierr)
+
+                ! 3. Write New Format Perturbation File
+                if (myid == 0) then
+                    open(1, file='vdf2d_unstruct_full_pert.dat', form='unformatted')
+                    ! Header
+                    write(1) Nx_all, Ny_all, Nvel, 1
+                    ! Coordinates (Useful for standalone plotting)
+                    write(1) (uSpace(k), k=1,Nvel), (vSpace(k), k=1,Nvel), (weight(k), k=1,Nvel)
+                    ! Data h'
+                    write(1) buff_vdf_pert_all
+                    close(1)
+                    deallocate(buff_vdf_pert_all)
+                endif
+
+            !>>> BRANCH B: Structured Perturbation (Standard) <<<
+            else 
+                Ndata = 2
+                allocate(solution_vdf_pert(nx,ny,Nvel,Ndata))
+                do j=1,ny
+                    do i=1,nx
+                        !Calculate structured perturbation VDFs through flattened cell-center views.
+                        do flat_k=1,Nvel
+                            solution_vdf_pert(i,j,flat_k,1) = ctr(i,j)%h_vec(flat_k)-ctr(i,j)%h0_vec(flat_k)
+                            solution_vdf_pert(i,j,flat_k,2) = ctr(i,j)%b_vec(flat_k)-ctr(i,j)%b0_vec(flat_k)
+                        enddo
+                    end do
+                end do
+
+                if(myid==0) then 
+                    allocate(solution_vdf_pert_all(Nx_all,Ny_all,Nvel,Ndata))
+                    do pj=0,NP_Y-1 
+                        do pi=0,NP_X-1
+                            np_recv=pj*NP_X+pi
+                            if(np_recv.eq.0) then
+                                do j1=1,ny
+                                    do i1=1,nx
+                                        solution_vdf_pert_all(i1,j1,1:Nvel,1:Ndata) = solution_vdf_pert(i1,j1,1:Nvel,1:Ndata)
+                                    enddo
+                                enddo
+                            else
+                                allocate(buff1_vdf_pert(Block_XY(np_recv)%NI,Block_XY(np_recv)%NJ,Nvel,Ndata))
+                                tag=np_recv*10 + 1 
+                                call MPI_Recv(buff1_vdf_pert,Block_XY(np_recv)%NI*Block_XY(np_recv)%NJ*Nvel*Ndata, &
+                                              MPI_KREAL,np_recv,tag,MPI_COMM_WORLD,Status,ierr)
+                                do j1=1,Block_XY(np_recv)%NJ
+                                    do i1=1,Block_XY(np_recv)%NI
+                                        i=Block_XY(np_recv)%Origin_I+i1-1
+                                        j=Block_XY(np_recv)%Origin_J+j1-1
+                                        solution_vdf_pert_all(i,j,1:Nvel,1:Ndata)=buff1_vdf_pert(i1,j1,1:Nvel,1:Ndata)
+                                    enddo
+                                enddo
+                                deallocate(buff1_vdf_pert)
+                            endif
+                        enddo
+                    enddo
+                else
+                    allocate(buff2_vdf_pert(nx,ny,Nvel,Ndata))
+                    tag=(IP_Y*NP_X+IP_X)*10 + 1 
+                    do j1=1,ny
+                        do i1=1,nx
+                            buff2_vdf_pert(i1,j1,1:Nvel,1:Ndata)=solution_vdf_pert(i1,j1,1:Nvel,1:Ndata)
+                        enddo
+                    enddo
+                    call MPI_Send(buff2_vdf_pert,nx*ny*Nvel*Ndata,MPI_KREAL,0,tag,MPI_COMM_WORLD,ierr)
+                    deallocate(buff2_vdf_pert)
+                endif
+                deallocate(solution_vdf_pert)
+                call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+
+                if(myid==0) then
+                    open(1,file='vdf2d_pert.dat',form='unformatted')
+                    write(1) 1
+                    write(1) nx_all,ny_all,Nvel*Ndata
+                    write(1) ((((solution_vdf_pert_all(i,j,flat_k,k),i=1,nx_all),j=1,ny_all),flat_k=1,Nvel),k=1,Ndata)
+                    close(1)
+                    deallocate(solution_vdf_pert_all)
+                endif
+            endif
+        endif
+        
+    end subroutine write_restart
+    
+
+end module Output

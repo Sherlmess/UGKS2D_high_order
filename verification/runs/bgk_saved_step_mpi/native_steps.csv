@@ -1,0 +1,2 @@
+step,time,face_moment,target_moment,cn_residual,macro_micro,limited,signed,dt_tau,cfl,h_min,h_max,b_min,b_max,global_drift,layout_s,face_s,map_s,collision_s,diagnostic_s
+1,  1.25000000E-03,  0.00000000E+00,  1.29324062E-15,  6.98424444E-16,  3.11693716E-15,  0.00000000E+00,  0.00000000E+00,  1.25000000E-02,  4.22134817E-02,  2.58649238E-23,  1.56522065E-01,  2.58649585E-23,  1.56521848E-01,  1.33226763E-15,  9.20710000E-02,  1.26333000E-01,  4.66000000E-04,  3.86440000E-02,  9.60000000E-05

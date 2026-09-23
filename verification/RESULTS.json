@@ -1,0 +1,145 @@
+{
+  "status": "PASS_REPRODUCIBLE_S2D_SNAPSHOT",
+  "source_files_bytewise_identical": 32,
+  "compile": {
+    "exit_code": 0,
+    "wall_s": 28.508031292000002,
+    "compiler": "GNU Fortran (Homebrew GCC 15.2.0) 15.2.0\nCopyright (C) 2025 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
+    "platform": "macOS-27.0-arm64-arm-64bit",
+    "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
+    "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+    "termination_test": "TERMINATION_CONTROL_PASS"
+  },
+  "numerical_checks": [
+    {
+      "case": "bgk_cold_smoke",
+      "argv": [
+        "mpirun",
+        "-np",
+        "1",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/bin/ugks_solver"
+      ],
+      "cwd": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/runs/bgk_cold_smoke",
+      "restart": null,
+      "timeout_s": 20,
+      "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+      "timed_out": false,
+      "exit_code": 0,
+      "wall_s": 0.499844084,
+      "final_sha256": "540efc4f38388c61df9031cc97fb30cebade7774debd14b3ffaaed63576338b7",
+      "PASS": true
+    },
+    {
+      "case": "bgk_saved_step",
+      "argv": [
+        "mpirun",
+        "-np",
+        "1",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/bin/ugks_solver"
+      ],
+      "cwd": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/runs/bgk_saved_step_mpi",
+      "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/examples/bgk_saved_step/restart.bin",
+      "timeout_s": 20,
+      "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+      "timed_out": false,
+      "exit_code": 0,
+      "wall_s": 1.313373167,
+      "final_sha256": "461e1d8a0409c46e0d3792d1d50eba02ded8c20e3f9241f6c70bffa100a2872c",
+      "final_bytewise_equal": true,
+      "PASS": true
+    },
+    {
+      "case": "shakhov_cold_smoke",
+      "argv": [
+        "mpirun",
+        "-np",
+        "1",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/bin/ugks_solver"
+      ],
+      "cwd": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/runs/shakhov_cold_smoke",
+      "restart": null,
+      "timeout_s": 20,
+      "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+      "timed_out": false,
+      "exit_code": 0,
+      "wall_s": 0.444609083,
+      "final_sha256": "87d452286adf279bccc9a5a75aefef39263e862dbb8351f360ab59caa351395d",
+      "PASS": true
+    },
+    {
+      "case": "shakhov_saved_step",
+      "argv": [
+        "mpirun",
+        "-np",
+        "1",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/bin/ugks_solver"
+      ],
+      "cwd": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/runs/shakhov_saved_step",
+      "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/examples/shakhov_saved_step/restart.bin",
+      "timeout_s": 20,
+      "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+      "timed_out": false,
+      "exit_code": 0,
+      "wall_s": 0.330037667,
+      "final_sha256": "f2ebbde22be7a02a180d88d31b6ebc7c8408b329c83bd418a400aef4f4cff510",
+      "final_bytewise_equal": true,
+      "PASS": true
+    },
+    {
+      "case": "steady_finish",
+      "argv": [
+        "mpirun",
+        "-np",
+        "1",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/bin/ugks_solver"
+      ],
+      "cwd": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/runs/steady_finish",
+      "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/examples/steady_finish/restart.bin",
+      "timeout_s": 20,
+      "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+      "timed_out": false,
+      "exit_code": 0,
+      "wall_s": 1.050002333,
+      "final_sha256": "90f7ad38c548d93d24804a36121616b964291b954d6bc41f1143f1d59d04fbf3",
+      "final_bytewise_equal": true,
+      "convergence_status": "mode converged iteration maxResidual\nS2Steady T 9    8.711308331E-09",
+      "nine_corrections_and_converged": true,
+      "PASS": true,
+      "offline_parser_correction": "Handles native header and residual column; reused successful run, no solver rerun."
+    },
+    {
+      "case": "steady_saved_step",
+      "argv": [
+        "mpirun",
+        "-np",
+        "1",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/bin/ugks_solver"
+      ],
+      "cwd": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/runs/steady_saved_step",
+      "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/exports/S2D_reproducible_base_20260923/examples/steady_saved_step/restart.bin",
+      "timeout_s": 20,
+      "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
+      "timed_out": false,
+      "exit_code": 0,
+      "wall_s": 0.324808125,
+      "final_sha256": "1806e2e666f1c397505597b4bb67a977b19f4751f897675837054fd8893ddf2b",
+      "final_bytewise_equal": true,
+      "PASS": true
+    }
+  ],
+  "accepted_steps_total": 16,
+  "saved_terminal_comparisons_bytewise": 4,
+  "cold_smoke_cases": 2,
+  "cold_steady_full_run": "NOT_RUN",
+  "new_numerical_wall_s": 3.962674459,
+  "new_scientific_claims": false,
+  "legacy_matrix": "NOT_RUN",
+  "source_algorithm_changes": false,
+  "committed": false,
+  "pushed": false,
+  "engineering_notes": [
+    "One sandbox MPI startup failed before solver execution; retained.",
+    "Steady status parser header handling corrected offline; solver was not rerun.",
+    "Documentation-link check initially preceded creation of RESULTS.json; generated summary then rechecked."
+  ]
+}

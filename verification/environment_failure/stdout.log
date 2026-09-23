@@ -1,0 +1,4 @@
+[sherlmesdeMacBook-Air.local:71777] [prterun-sherlmesdeMacBook-Air-71777@0,0] bind() failed for port 0: Operation not permitted (1)
+[sherlmesdeMacBook-Air.local:71777] [prterun-sherlmesdeMacBook-Air-71777@0,0] bind() failed for port 0: Operation not permitted (1)
+[sherlmesdeMacBook-Air.local:71777] PRTE ERROR: Fatal in file oob_tcp_component.c at line 582
+[71777] base/ptl_base_listener.c:604 bind() failed for socket 7 storage size 16: Operation not permitted

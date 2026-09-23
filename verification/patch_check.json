@@ -1,0 +1,5 @@
+{
+  "patch_applies_to_v2": true,
+  "resulting_src_and_makefile_bytewise_equal": true,
+  "only_temporary_copy_modified": true
+}

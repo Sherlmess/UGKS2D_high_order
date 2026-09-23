@@ -1,0 +1,9 @@
+{
+  "numeric_source_unchanged": true,
+  "inherited_source_and_evidence_whitespace": "Retained bytewise; full initial-import whitespace check reports preexisting CRLF/trailing-space formatting. No formatting changes made to frozen evidence.",
+  "release_docs_whitespace_check": "PASS",
+  "publication_repository": "git@github.com:Sherlmess/UGKS2D_high_order.git",
+  "publication_tag": "v1.0",
+  "source_tag": "implicitUGKS/v2.0",
+  "rerun_numerical_matrix": false
+}

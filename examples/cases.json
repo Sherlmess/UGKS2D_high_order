@@ -1,0 +1,51 @@
+{
+  "bgk_saved_step": {
+    "restart": true,
+    "expected_final": true,
+    "origin": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/s2d_i3_r1_20260923T023248Z/qualification/C4/new",
+    "max_seconds": 20,
+    "purpose": "one accepted step from archived state"
+  },
+  "shakhov_saved_step": {
+    "restart": true,
+    "expected_final": true,
+    "origin": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/s2d_i3_r1_20260923T023248Z/qualification/Shakhov/new",
+    "max_seconds": 20,
+    "purpose": "one accepted step from archived state"
+  },
+  "steady_saved_step": {
+    "restart": true,
+    "expected_final": true,
+    "origin": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/s2d_i3_r1_20260923T023248Z/qualification/I1300/new",
+    "max_seconds": 20,
+    "purpose": "one accepted step from archived state"
+  },
+  "steady_finish": {
+    "restart": true,
+    "expected_final": true,
+    "origin": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/s2d_i3_r1_20260923T023248Z/runs/I1300_to_gate",
+    "max_seconds": 20,
+    "purpose": "9 actual corrections from cumulative 1300; native counter restarts at zero"
+  },
+  "bgk_cold_smoke": {
+    "restart": false,
+    "expected_final": false,
+    "origin": "bgk_saved_step",
+    "max_seconds": 20,
+    "purpose": "cold start; no new full trajectory qualification in this packaging task"
+  },
+  "shakhov_cold_smoke": {
+    "restart": false,
+    "expected_final": false,
+    "origin": "shakhov_saved_step",
+    "max_seconds": 20,
+    "purpose": "cold start; no new full trajectory qualification in this packaging task"
+  },
+  "steady_cold": {
+    "restart": false,
+    "expected_final": false,
+    "origin": "steady_finish",
+    "max_seconds": 120,
+    "purpose": "cold start; no new full trajectory qualification in this packaging task"
+  }
+}
