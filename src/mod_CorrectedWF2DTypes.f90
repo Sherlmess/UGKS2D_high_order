@@ -3,8 +3,6 @@ module mod_CorrectedWF2DTypes
     implicit none
     private
 
-    public :: GasThermo2D, CollisionPointModel2D
-    public :: CorrectedWF2DDiagnostics, CorrectedWF2DWorkspace
     public :: invalidate_corrected_wf_workspace
 
     type, public :: GasThermo2D

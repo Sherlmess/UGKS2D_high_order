@@ -1,0 +1,2937 @@
+--- a/src/main_UGKS2D.f90
++++ b/src/main_UGKS2D.f90
+@@ -28,6 +28,7 @@
+     use mpi_wrapper
+     use InitializeFlow
+     use Solver
++    use mod_R5Observe,only:RecordTerminalIO
+     use Output
+     use mod_S2D1, only: IsS2D1,RunS2D1
+     implicit none
+@@ -70,6 +71,7 @@
+     !Output solution
+     s2_final_output_start=MPI_Wtime()
+     call Output_result()
++    call RecordTerminalIO(MPI_Wtime()-s2_final_output_start)
+     call CartesianStats(s2_loop_total,time_output_acc+MPI_Wtime()-s2_final_output_start,s2_comm_loop)
+     
+     !Finalize MPI
+--- /dev/null
++++ b/src/mod_ClosedCouetteMass.f90
+@@ -0,0 +1,394 @@
++! Opt-in uniform rescaling; no mass collectives are called on the disabled path.
++module mod_ClosedCouetteMass
++    use flow_data
++    use Flow_DIS
++    use mod_ImplicitState
++    use mod_ImplicitCommon, only: MomentConserved, IsPhysicalState
++    use Tools, only: GetPrimary, GetTau, GetHeatFlux_Vec
++    use mpi
++    use Boundary, only: Set_Ghost_PhysBoundary
++    use mpi_wrapper, only: MPIUpdate_CellConVars, MPIUpdate_CellVDF, MPIUpdate_Conner_conVars, MPIUpdate_Conner_VDF
++    use, intrinsic :: ieee_arithmetic
++    implicit none
++    real(KREAL), save :: closed_mass_target=0.0_KREAL
++    real(KREAL), save :: mass_scale=1.0_KREAL, mass_scale_seconds=0.0_KREAL, mass_refresh_seconds=0.0_KREAL
++    real(KREAL), save :: correction_ledger(4)=0.0_KREAL
++    real(KREAL), save :: mass_before(5),mass_after(5),mass_before_metrics(5),mass_after_metrics(5),mass_shape_error(4)
++    real(KREAL), save :: update_before(4),update_after(4),scale_increment(4)
++    logical, save :: target_loaded=.false., snapshot_active=.false.
++    integer, save :: restart_step=0
++    real(KREAL), allocatable :: actual_tau(:,:)
++    ! Scalar derived-type copies retain pointer associations. Backing storage is copied separately.
++    type(CellCenter), allocatable :: saved_ctr(:,:)
++    type(CellInterface), allocatable :: saved_vface(:,:),saved_hface(:,:)
++    real(KREAL) :: saved_ledger(4),saved_diagnostics(23)
++    real(KREAL),allocatable :: saved_actual_tau(:,:)
++    real(KREAL), allocatable :: saved_cell_h_store(:,:,:)
++    real(KREAL), allocatable :: saved_cell_b_store(:,:,:)
++    real(KREAL), allocatable :: saved_cell_sh_store(:,:,:,:)
++    real(KREAL), allocatable :: saved_cell_sb_store(:,:,:,:)
++    real(KREAL), allocatable :: saved_v_l_flux_h_store(:,:,:)
++    real(KREAL), allocatable :: saved_v_l_flux_b_store(:,:,:)
++    real(KREAL), allocatable :: saved_v_r_flux_h_store(:,:,:)
++    real(KREAL), allocatable :: saved_v_r_flux_b_store(:,:,:)
++    real(KREAL), allocatable :: saved_h_l_flux_h_store(:,:,:)
++    real(KREAL), allocatable :: saved_h_l_flux_b_store(:,:,:)
++    real(KREAL), allocatable :: saved_h_r_flux_h_store(:,:,:)
++    real(KREAL), allocatable :: saved_h_r_flux_b_store(:,:,:)
++    real(KREAL), allocatable :: saved_res_macro_flux_store(:,:,:)
++    real(KREAL), allocatable :: saved_res_macro_store(:,:,:)
++    real(KREAL), allocatable :: saved_res_h_flux_store(:,:,:)
++    real(KREAL), allocatable :: saved_res_b_flux_store(:,:,:)
++    real(KREAL), allocatable :: saved_rate_w(:,:,:)
++    real(KREAL), allocatable :: saved_stream_h(:,:,:)
++    real(KREAL), allocatable :: saved_stream_b(:,:,:)
++    real(KREAL), allocatable :: saved_delta_w(:,:,:)
++    real(KREAL), allocatable :: saved_delta_h(:,:,:)
++    real(KREAL), allocatable :: saved_delta_b(:,:,:)
++    real(KREAL), allocatable :: saved_w_tilde(:,:,:)
++    real(KREAL), allocatable :: saved_tau_tilde(:,:)
++    real(KREAL), allocatable :: saved_q_frozen(:,:,:)
++    real(KREAL), allocatable :: saved_equilibrium_h(:,:,:)
++    real(KREAL), allocatable :: saved_equilibrium_b(:,:,:)
++contains
++    subroutine SaveMassTransaction()
++        if (snapshot_active) call MassAbort("nested mass transaction")
++        saved_ctr=ctr; saved_vface=vface; saved_hface=hface
++        saved_diagnostics=[implicit_macro_residual,implicit_macro_relative,implicit_macro_absolute, &
++            implicit_h_norm,implicit_b_norm,implicit_h_relative,implicit_b_relative,implicit_h_absolute,implicit_b_absolute, &
++            implicit_moment_error,implicit_mass_defect,implicit_ncfl_active,implicit_alpha,mass_scale]
++        saved_ledger=correction_ledger
++        if (allocated(actual_tau)) saved_actual_tau=actual_tau
++        saved_cell_h_store=cell_h_store
++        saved_cell_b_store=cell_b_store
++        saved_cell_sh_store=cell_sh_store
++        saved_cell_sb_store=cell_sb_store
++        saved_v_l_flux_h_store=v_l_flux_h_store
++        saved_v_l_flux_b_store=v_l_flux_b_store
++        saved_v_r_flux_h_store=v_r_flux_h_store
++        saved_v_r_flux_b_store=v_r_flux_b_store
++        saved_h_l_flux_h_store=h_l_flux_h_store
++        saved_h_l_flux_b_store=h_l_flux_b_store
++        saved_h_r_flux_h_store=h_r_flux_h_store
++        saved_h_r_flux_b_store=h_r_flux_b_store
++        saved_res_macro_flux_store=res_macro_flux_store
++        saved_res_macro_store=res_macro_store
++        saved_res_h_flux_store=res_h_flux_store
++        saved_res_b_flux_store=res_b_flux_store
++        saved_rate_w=rate_w
++        saved_stream_h=stream_h
++        saved_stream_b=stream_b
++        saved_delta_w=delta_w
++        saved_delta_h=delta_h
++        saved_delta_b=delta_b
++        saved_w_tilde=w_tilde
++        saved_tau_tilde=tau_tilde
++        saved_q_frozen=q_frozen
++        saved_equilibrium_h=equilibrium_h
++        saved_equilibrium_b=equilibrium_b
++        snapshot_active=.true.
++    end subroutine
++    subroutine RestoreMassTransaction()
++        ctr=saved_ctr; vface=saved_vface; hface=saved_hface
++        implicit_macro_residual=saved_diagnostics(1:4);implicit_macro_relative=saved_diagnostics(5:8)
++        implicit_macro_absolute=saved_diagnostics(9:12)
++        implicit_h_norm=saved_diagnostics(13);implicit_b_norm=saved_diagnostics(14)
++        implicit_h_relative=saved_diagnostics(15);implicit_b_relative=saved_diagnostics(16)
++        implicit_h_absolute=saved_diagnostics(17);implicit_b_absolute=saved_diagnostics(18)
++        implicit_moment_error=saved_diagnostics(19);implicit_mass_defect=saved_diagnostics(20)
++        implicit_ncfl_active=saved_diagnostics(21);implicit_alpha=saved_diagnostics(22);mass_scale=saved_diagnostics(23)
++        correction_ledger=saved_ledger
++        if (allocated(saved_actual_tau)) actual_tau=saved_actual_tau
++        cell_h_store=saved_cell_h_store
++        cell_b_store=saved_cell_b_store
++        cell_sh_store=saved_cell_sh_store
++        cell_sb_store=saved_cell_sb_store
++        v_l_flux_h_store=saved_v_l_flux_h_store
++        v_l_flux_b_store=saved_v_l_flux_b_store
++        v_r_flux_h_store=saved_v_r_flux_h_store
++        v_r_flux_b_store=saved_v_r_flux_b_store
++        h_l_flux_h_store=saved_h_l_flux_h_store
++        h_l_flux_b_store=saved_h_l_flux_b_store
++        h_r_flux_h_store=saved_h_r_flux_h_store
++        h_r_flux_b_store=saved_h_r_flux_b_store
++        res_macro_flux_store=saved_res_macro_flux_store
++        res_macro_store=saved_res_macro_store
++        res_h_flux_store=saved_res_h_flux_store
++        res_b_flux_store=saved_res_b_flux_store
++        rate_w=saved_rate_w
++        stream_h=saved_stream_h
++        stream_b=saved_stream_b
++        delta_w=saved_delta_w
++        delta_h=saved_delta_h
++        delta_b=saved_delta_b
++        w_tilde=saved_w_tilde
++        tau_tilde=saved_tau_tilde
++        q_frozen=saved_q_frozen
++        equilibrium_h=saved_equilibrium_h
++        equilibrium_b=saved_equilibrium_b
++    end subroutine
++    subroutine ReleaseMassTransaction()
++        deallocate(saved_ctr,saved_vface,saved_hface)
++        if (allocated(saved_actual_tau)) deallocate(saved_actual_tau)
++        deallocate(saved_cell_h_store)
++        deallocate(saved_cell_b_store)
++        deallocate(saved_cell_sh_store)
++        deallocate(saved_cell_sb_store)
++        deallocate(saved_v_l_flux_h_store)
++        deallocate(saved_v_l_flux_b_store)
++        deallocate(saved_v_r_flux_h_store)
++        deallocate(saved_v_r_flux_b_store)
++        deallocate(saved_h_l_flux_h_store)
++        deallocate(saved_h_l_flux_b_store)
++        deallocate(saved_h_r_flux_h_store)
++        deallocate(saved_h_r_flux_b_store)
++        deallocate(saved_res_macro_flux_store)
++        deallocate(saved_res_macro_store)
++        deallocate(saved_res_h_flux_store)
++        deallocate(saved_res_b_flux_store)
++        deallocate(saved_rate_w)
++        deallocate(saved_stream_h)
++        deallocate(saved_stream_b)
++        deallocate(saved_delta_w)
++        deallocate(saved_delta_h)
++        deallocate(saved_delta_b)
++        deallocate(saved_w_tilde)
++        deallocate(saved_tau_tilde)
++        deallocate(saved_q_frozen)
++        deallocate(saved_equilibrium_h)
++        deallocate(saved_equilibrium_b)
++        snapshot_active=.false.
++    end subroutine
++    subroutine MassAbort(message)
++        character(len=*),intent(in) :: message
++        if (myID==0) write(*,'(a)') 'ClosedCouetteMassRescale: '//message
++        call MPI_Abort(MPI_COMM_WORLD,941,ierr)
++    end subroutine
++
++    pure logical function ValidMass(m)
++        real(KREAL),intent(in) :: m
++        ValidMass=ieee_is_finite(m) .and. m>0.0_KREAL
++    end function
++
++    subroutine MassStatistics(totals,metrics,ok)
++        ! totals = integral W(1:4), integral discrete h density. Physical cells only.
++        ! metrics = max moment error, max negative h/b fraction, minimum rho/internal energy.
++        real(KREAL),intent(out) :: totals(5),metrics(5)
++        logical,intent(out) :: ok
++        real(KREAL) :: local(5),mx(3),mn(2),mm(4),e,nh,nb
++        logical :: local_ok
++        integer :: i,j
++        local=0;mx=0;mn=huge(1.0_KREAL);local_ok=.true.
++        do j=1,ny; do i=1,nx
++            call MomentConserved(ctr(i,j)%h_vec,ctr(i,j)%b_vec,uVel,vVel,wVel,mm)
++            local_ok=local_ok .and. all(ieee_is_finite(ctr(i,j)%h_vec)) .and. &
++                all(ieee_is_finite(ctr(i,j)%b_vec)) .and. IsPhysicalState(ctr(i,j)%conVars) .and. &
++                IsPhysicalState(mm) .and. ValidMass(ctr(i,j)%area)
++            local(1:4)=local(1:4)+ctr(i,j)%area*ctr(i,j)%conVars
++            local(5)=local(5)+ctr(i,j)%area*mm(1)
++            mx(1)=max(mx(1),maxval(abs(ctr(i,j)%conVars-mm)/max(abs(ctr(i,j)%conVars),1.0_KREAL)))
++            nh=sum(wVel*max(-ctr(i,j)%h_vec,0.0_KREAL))/max(sum(wVel*abs(ctr(i,j)%h_vec)),tiny(1.0_KREAL))
++            nb=sum(wVel*max(-ctr(i,j)%b_vec,0.0_KREAL))/max(sum(wVel*abs(ctr(i,j)%b_vec)),tiny(1.0_KREAL))
++            mx(2)=max(mx(2),nh);mx(3)=max(mx(3),nb)
++            if (ValidMass(ctr(i,j)%conVars(1))) then
++                e=ctr(i,j)%conVars(4)-0.5_KREAL*sum(ctr(i,j)%conVars(2:3)**2)/ctr(i,j)%conVars(1)
++                mn=min(mn,[ctr(i,j)%conVars(1),e])
++            endif
++        enddo; enddo
++        call MPI_Allreduce(local,totals,5,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(mx,metrics(1:3),3,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(mn,metrics(4:5),2,MPI_KREAL,MPI_MIN,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(local_ok,ok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        ok=ok .and. all(ieee_is_finite(totals)) .and. all(ieee_is_finite(metrics)) .and. &
++            metrics(1)<=Implicit_MomentTol
++    end subroutine
++
++    subroutine CheckMassState(ok)
++        logical,intent(out) :: ok
++        real(KREAL) :: t(5),m(5)
++        call MassStatistics(t,m,ok)
++    end subroutine
++
++    subroutine InitializeClosedMass()
++        logical :: ok
++        real(KREAL) :: t(5),m(5),low,high
++        integer :: i,j
++        logical :: rectangular,global_rectangular
++        rectangular=.true.
++        do j=1,ny+1;do i=1,nx+1
++            rectangular=rectangular .and. abs(gridx(i,j)-gridx(i,1))<=1.0e-14_KREAL .and. &
++                abs(gridy(i,j)-gridy(1,j))<=1.0e-14_KREAL
++        enddo;enddo
++        call MPI_Allreduce(rectangular,global_rectangular,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        if (.not.global_rectangular) call MassAbort('requires verified Cartesian Couette geometry')
++        call MassStatistics(t,m,ok)
++        if (.not.ok) call MassAbort('initial macro/micro or physical-state gate failed')
++        if (Iflag_InitFlow==Init_Freestream) then
++            closed_mass_target=t(1)
++            correction_ledger=0.0_KREAL
++            target_loaded=.true.
++        else if (.not.target_loaded) then
++            call MassAbort('restart lacks persistent M0; current mass is not a target')
++        endif
++        call MPI_Allreduce(closed_mass_target,low,1,MPI_KREAL,MPI_MIN,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(closed_mass_target,high,1,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        if (.not.ValidMass(low) .or. low/=high) call MassAbort('invalid or inconsistent M0 across ranks')
++        allocate(actual_tau(nx,ny))
++        do j=1,ny;do i=1,nx
++            actual_tau(i,j)=GetTau(GetPrimary(ctr(i,j)%conVars))
++        enddo;enddo
++        if (myID==0) write(*,'(a,es25.16e3)') 'persistent_M0=',closed_mass_target
++    end subroutine
++
++    subroutine RescaleClosedMass(ok)
++        logical,intent(out) :: ok
++        logical :: local_ok,global_ok
++        integer :: i,j
++        real(KREAL) :: start,prim0(4),prim1(4),err(4),globerr(4),oldmass(4),change(4),global_change(4)
++        real(KREAL) :: h0(Nvel),b0(Nvel),w0(4),tau
++        start=MPI_Wtime()
++        call MassStatistics(mass_before,mass_before_metrics,ok)
++        if (.not.ok .or. .not.ValidMass(mass_before(1)) .or. .not.ValidMass(closed_mass_target)) then
++            ok=.false.;return
++        endif
++        mass_scale=closed_mass_target/mass_before(1)
++        if (.not.ValidMass(mass_scale)) then
++            ok=.false.;return
++        endif
++        ! Preflight every scaled candidate before any GetPrimary call can abort on overflow.
++        local_ok=.true.
++        do j=1,ny;do i=1,nx
++            local_ok=local_ok .and. IsPhysicalState(mass_scale*ctr(i,j)%conVars) .and. &
++                all(ieee_is_finite(mass_scale*ctr(i,j)%h_vec)) .and. all(ieee_is_finite(mass_scale*ctr(i,j)%b_vec))
++        enddo;enddo
++        call MPI_Allreduce(local_ok,global_ok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        ok=global_ok
++        if (.not.ok) return
++        err=0.0_KREAL;change=0.0_KREAL
++        do j=1,ny; do i=1,nx
++            w0=ctr(i,j)%conVars;h0=ctr(i,j)%h_vec;b0=ctr(i,j)%b_vec
++            prim0=GetPrimary(w0)
++            ctr(i,j)%conVars=mass_scale*w0
++            ctr(i,j)%h_vec=mass_scale*h0
++            ctr(i,j)%b_vec=mass_scale*b0
++            prim1=GetPrimary(ctr(i,j)%conVars)
++            err(1)=max(err(1),maxval(abs(prim1(2:3)-prim0(2:3))))
++            err(2)=max(err(2),abs(1.0_KREAL/prim1(4)-1.0_KREAL/prim0(4)))
++            err(3)=max(err(3),maxval(abs(ctr(i,j)%h_vec/ctr(i,j)%conVars(1)-h0/w0(1))))
++            err(4)=max(err(4),maxval(abs(ctr(i,j)%b_vec/ctr(i,j)%conVars(1)-b0/w0(1))))
++            change=change+ctr(i,j)%area*(w0-saved_ctr(i,j)%conVars)
++        enddo; enddo
++        call MPI_Allreduce(err,globerr,4,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        mass_shape_error=globerr
++        call MPI_Allreduce(change,global_change,4,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
++        update_before=global_change
++        call MassStatistics(mass_after,mass_after_metrics,ok)
++        scale_increment=mass_after(1:4)-mass_before(1:4)
++        update_after=update_before+scale_increment
++        mass_scale_seconds=mass_scale_seconds+MPI_Wtime()-start
++        if (.not.ok) return
++        start=MPI_Wtime();local_ok=.true.
++        do j=1,ny; do i=1,nx
++            ! Recompute the actual pressure-dependent tau; do not retain predictor tau.
++            prim1=GetPrimary(ctr(i,j)%conVars);tau=GetTau(prim1)
++            local_ok=local_ok .and. ValidMass(tau)
++            actual_tau(i,j)=tau;tau_tilde(i,j)=tau
++            w_tilde(:,i,j)=ctr(i,j)%conVars
++            q_frozen(:,i,j)=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim1)
++        enddo; enddo
++        ! Predictor equilibrium belongs to the old direction and must be rebuilt before reuse.
++        equilibrium_h=0.0_KREAL;equilibrium_b=0.0_KREAL
++        call MPI_Allreduce(local_ok,global_ok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        ok=global_ok
++        if (ok) then
++            call Set_Ghost_PhysBoundary()
++            call MPIUpdate_CellConVars()
++            call MPIUpdate_CellVDF()
++            call MPIUpdate_Conner_conVars()
++            call MPIUpdate_Conner_VDF()
++            implicit_moment_error=mass_after_metrics(1)
++            correction_ledger=correction_ledger+scale_increment
++        endif
++        mass_refresh_seconds=mass_refresh_seconds+MPI_Wtime()-start
++    end subroutine
++
++    function RestartIdentity() result(identity)
++        real(KREAL) :: identity(31)
++        identity=[real(Nx_all,KREAL),real(Ny_all,KREAL),real(NP_X,KREAL),real(NP_Y,KREAL), &
++            real(Nu,KREAL),real(Nv,KREAL),CFL,Implicit_nCFL,real(ck,KREAL),Pr,omega,Tinf,Tw,CouetteMuRef, &
++            WallUx,real(BC_Type,KREAL),real(flag_vislaw,KREAL),real(FluxWall_type,KREAL),ACC, &
++            real(BG_geometry,KREAL),real(Quadrature_method,KREAL), &
++            merge(1.0_KREAL,0.0_KREAL,Implicit_ZhuMovingWall),merge(1.0_KREAL,0.0_KREAL,Implicit_InitHaloResync), &
++            sum(wVel),sum(wVel*uVel*uVel)]
++    end function
++
++    subroutine WriteMassRestart()
++        integer :: unit,i,j,ios,version
++        logical :: ok,global_ok
++        character(len=64) :: name
++        version=4
++        write(name,'(a,i0,a)') 'closed_mass_rank',myID,'.bin'
++        open(newunit=unit,file=trim(name),access='stream',form='unformatted',status='replace',iostat=ios)
++        ok=ios==0
++        if (ok) then
++            write(unit,iostat=ios) version,nx,ny,Nvel,LAP,iter,closed_mass_target,correction_ledger,RestartIdentity()
++            ok=ios==0
++            do j=1-LAP,ny+LAP; do i=1-LAP,nx+LAP
++                if (ok) then
++                    write(unit,iostat=ios) ctr(i,j)%conVars,ctr(i,j)%h_vec,ctr(i,j)%b_vec
++                    ok=ios==0
++                endif
++            enddo; enddo
++            close(unit)
++        endif
++        call MPI_Allreduce(ok,global_ok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        if (.not.global_ok) call MassAbort('cannot write complete M0-bearing restart')
++    end subroutine
++
++    subroutine ReadMassRestart()
++        integer :: unit,i,j,ios,header(6)
++        logical :: ok,global_ok
++        real(KREAL) :: identity(31),w(4),h(Nvel),b(Nvel),lo,hi,lmin(4),lmax(4)
++        integer :: smin,smax
++        character(len=64) :: name
++        write(name,'(a,i0,a)') 'closed_mass_rank',myID,'.bin'
++        open(newunit=unit,file=trim(name),access='stream',form='unformatted',status='old',iostat=ios)
++        ok=ios==0
++        if (ok) then
++            read(unit,iostat=ios) header,closed_mass_target,correction_ledger,identity
++            ok=ios==0
++            if (ok) ok=all(header(1:5)==[4,nx,ny,Nvel,LAP]) .and. &
++                all(identity==RestartIdentity()) .and. ValidMass(closed_mass_target) .and. &
++                all(ieee_is_finite(correction_ledger))
++            if (ok) then
++                restart_step=header(6)
++                do j=1-LAP,ny+LAP; do i=1-LAP,nx+LAP
++                    if (ok) then
++                        read(unit,iostat=ios) w,h,b
++                        ok=ios==0
++                        if (ok .and. i>=1 .and. i<=nx .and. j>=1 .and. j<=ny) then
++                            ! Bind the M0 metadata to the matching native physical restart, not a different flow pair.
++                            ok=all(w==ctr(i,j)%conVars) .and. all(h==ctr(i,j)%h_vec) .and. all(b==ctr(i,j)%b_vec)
++                        endif
++                        if (ok) then
++                            ctr(i,j)%conVars=w;ctr(i,j)%h_vec=h;ctr(i,j)%b_vec=b
++                        endif
++                    endif
++                enddo; enddo
++            endif
++            close(unit)
++        endif
++        call MPI_Allreduce(ok,global_ok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        if (.not.global_ok) call MassAbort('missing, mismatched, or invalid M0-bearing restart; refusing to redefine M0')
++        call MPI_Allreduce(closed_mass_target,lo,1,MPI_KREAL,MPI_MIN,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(closed_mass_target,hi,1,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        if (lo/=hi) call MassAbort('restart M0 differs between ranks')
++        call MPI_Allreduce(correction_ledger,lmin,4,MPI_KREAL,MPI_MIN,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(correction_ledger,lmax,4,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(restart_step,smin,1,MPI_INTEGER,MPI_MIN,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(restart_step,smax,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierr)
++        if (any(lmin/=lmax) .or. smin/=smax) call MassAbort('restart ledger or origin step differs across ranks')
++        target_loaded=.true.
++        ! Original native restart iteration semantics are additional steps; preserve origin separately.
++    end subroutine
++end module mod_ClosedCouetteMass
+--- a/src/mod_Evolution.f90
++++ b/src/mod_Evolution.f90
+@@ -68,25 +68,25 @@
+         !---------------------------------------------------------------------------
+         if(IP_X==0 .and. bc_type(1)==BCconst_wall_isothermal) then    !I direction and lower boundaryface
+             do j=1,ny
+-                call CalcFluxBoundary(Prim_wall,vface(1,j),ctr(1,j),IDIRC,Lside) !RN means no frame rotation
++                call CalcFluxBoundary(WallPrimary(1),vface(1,j),ctr(1,j),IDIRC,Lside) !RN means no frame rotation
+             enddo
+         endif
+             
+         if(IP_X==NP_X-1 .and. bc_type(2)==BCconst_wall_isothermal) then   !I direction and upper boundaryface
+             do j=1,ny
+-                call CalcFluxBoundary(Prim_wall,vface(nx+1,j),ctr(nx,j),IDIRC,Rside) !RY means frame rotation
++                call CalcFluxBoundary(WallPrimary(2),vface(nx+1,j),ctr(nx,j),IDIRC,Rside) !RY means frame rotation
+             enddo
+         endif
+             
+         if(IP_Y==0 .and. bc_type(3)==BCconst_wall_isothermal) then   !J direction and lower boundaryface
+             do i=1,nx
+-                call CalcFluxBoundary(Prim_wall,hface(i,1),ctr(i,1),JDIRC,Lside) !RN means no frame rotation
++                call CalcFluxBoundary(WallPrimary(3),hface(i,1),ctr(i,1),JDIRC,Lside) !RN means no frame rotation
+             enddo   
+         endif
+                 
+         if(IP_Y==NP_Y-1 .and. bc_type(4)==BCconst_wall_isothermal) then   !J direction and upper boundaryface
+             do i=1,nx
+-                call CalcFluxBoundary(Prim_wall,hface(i,ny+1),ctr(i,ny),JDIRC,Rside) !RY means frame rotation
++                call CalcFluxBoundary(WallPrimary(4),hface(i,ny+1),ctr(i,ny),JDIRC,Rside) !RY means frame rotation
+             enddo    
+         endif
+         
+@@ -840,7 +840,11 @@
+         if (FluxWall_type==FluxWall_Kinetic) then
+             call KineticFluxBoundary(bc,face,cell,idx,side)
+         elseif (FluxWall_type==FluxWall_Multiscale) then
+-            call MultiscaleFluxBoundary(bc,face,cell,idx,side)
++            if(CouetteUseW2BWall)then
++                call W2BMultiscaleFluxBoundary(bc,face,cell,idx,side)
++            else
++                call MultiscaleFluxBoundary(bc,face,cell,idx,side)
++            endif
+         elseif (FluxWall_type==FluxWall_Maxwell) then
+             call KBC_Maxwell(bc,face,cell,idx,side)
+         else
+@@ -1855,4 +1859,546 @@
+     end function Moment_auvxi
+     
+     
++    subroutine W2BMultiscaleFluxBoundary(bc,face,cell,idx,side)
++        real(KREAL), intent(in)                         :: bc(4) !Primary variables at boundary
++        type(CellInterface), intent(inout)              :: face
++        type(CellCenter), intent(in)                    :: cell
++        integer(KINT), intent(in)                       :: idx,side
++        integer(KINT)                                   :: k !Flattened velocity-space index
++        real(KREAL)                                     :: rot
++        real(KREAL), allocatable, dimension(:)          :: vn_vec,vt_vec !Pure 1D local-frame velocities
++        real(KREAL), allocatable, dimension(:)          :: h_vec,b_vec !Pure 1D reconstructed wall distributions
++        real(KREAL), allocatable, dimension(:)          :: H_g_vec,B_g_vec !Pure 1D interface Maxwellian arrays
++        real(KREAL), allocatable, dimension(:)          :: H_w_vec,B_w_vec !Pure 1D wall Maxwellian arrays
++        real(KREAL), allocatable, dimension(:)          :: H_plus_vec,B_plus_vec !Pure 1D Shakhov correction arrays
++        real(KREAL)                                     :: qf(2)
++        real(KREAL), allocatable, dimension(:)          :: delta_vec !Pure 1D wall upwind selector
++        real(KREAL)                                     :: flux(4)
++        real(KREAL)                                     :: flux_wall(4) !Accumulated wall macro-flux correction from Nvel loop
++        real(KREAL)                                     :: prim(4)
++        real(KREAL)                                     :: prim_g(4) !Primary variables of g_{i+1/2}
++        real(KREAL)                                     :: prim_w(4) !boundary condition in local frame
++        real(KREAL)                                     :: prim_g0(4),conVars_g0(4),conVars_g(4),conVars_g1(4)
++        real(KREAL)                                     :: incidence,reflection
++        !real(KREAL)                                     :: tau,T1,T4,T5
++        real(KREAL)                                     :: tau,Mt(5)
++        real(KREAL)                                     :: wk,vnK,vtK,v2 !Reusable velocity-space scalars for Nvel loops
++        real(KREAL)                                     :: deltaK,inflowK !Wall reflected/incident selectors for Nvel loops
++        real(KREAL)                                     :: H_gK,B_gK,H_wK,B_wK !Per-velocity Maxwellian values for micro flux
++        real(KREAL)                                     :: H_plusK,B_plusK !Per-velocity Shakhov correction values for micro flux
++        real(KREAL)                                     :: hK,bK !Per-velocity reconstructed distribution values
++        real(KREAL)                                     :: shnK,sbnK,shtK,sbtK !Per-velocity distribution slopes
++        real(KREAL)                                     :: slope_hK,slope_bK !Per-velocity normal/tangential slope combinations
++        real(KREAL)                                     :: wallExpK !Per-velocity Maxwellian kernel used by wall reflection
++        real(KREAL)                                     :: Ha_gnK,Ha_gtK,Ha_TK !Per-velocity h-space expansion terms
++        real(KREAL)                                     :: Ba_gnK,Ba_gtK,Ba_TK !Per-velocity b-space expansion terms
++        real(KREAL)                                     :: dt   !local time step
++
++        real(KREAL),parameter :: PI=4.0_KREAL*atan(1.0_KREAL) ! Only this new wall kernel.
++
++        ! additional variables for slope calculation
++        real(KREAL), allocatable, dimension(:)          :: shn_vec,sbn_vec !Pure 1D normal distribution slopes
++        !real(KREAL), allocatable, dimension(:,:)        :: Ha_gn, Ba_gn
++        !real(KREAL), allocatable, dimension(:,:)        :: Ha_gt, Ba_gt 
++        !real(KREAL), allocatable, dimension(:,:)        :: Ha_T, Ba_T  
++        real(KREAL)                                     :: a_gn(4), a_gt(4), a_T(4)    
++        real(KREAL)                                     :: sw(4), sw_T(4)
++        real(KREAL)                                     :: Mau(4), Mbv(4), Mau0(4), MauT(4)
++        real(KREAL)                                     :: Mu(0:MNUM),MuL(0:MNUM),MuR(0:MNUM)
++        real(KREAL)                                     :: Mv(0:MTUM),Mxi(0:2)
++
++        ! tangential slope variables
++        real(KREAL), allocatable, dimension(:)          :: sht_vec,sbt_vec !Pure 1D tangential distribution slopes
++        !limiter of tangential slope
++        !real(KREAL)                                     :: tan_len, d_rho_t, limiter_phi
++        !real(KREAL), parameter                          :: EPS = 1.0e-10
++        !real(KREAL), parameter                          :: LIMIT_THRESHOLD = 0.5  ! allow max 50% change in tangential direction
++
++
++
++        !--------------------------------------------------
++        !prepare
++        !--------------------------------------------------
++        !Allocate pure 1D velocity-space temporaries for multiscale wall flux loops.
++        allocate(vn_vec(Nvel))
++        allocate(vt_vec(Nvel))
++        allocate(delta_vec(Nvel))
++        allocate(h_vec(Nvel))
++        allocate(b_vec(Nvel))
++        allocate(H_plus_vec(Nvel))
++        allocate(B_plus_vec(Nvel))
++        allocate(H_g_vec(Nvel))
++        allocate(B_g_vec(Nvel))
++        allocate(H_w_vec(Nvel))
++        allocate(B_w_vec(Nvel))
++        allocate(shn_vec(Nvel))
++        allocate(sbn_vec(Nvel))
++        allocate(sht_vec(Nvel))
++        allocate(sbt_vec(Nvel))
++
++        !Time step
++        dt = cell%dt_local
++        
++        !Frame rotation
++        rot = -side
++
++        !Convert velocity space to the wall frame and build the wall upwind selector.
++        do k=1,Nvel
++            vn_vec(k) = uVel(k)*face%cosx+vVel(k)*face%cosy
++            vt_vec(k) =-uVel(k)*face%cosy+vVel(k)*face%cosx
++            delta_vec(k) = (sign(UP,vn_vec(k))*rot+1.0_KREAL)/2.0_KREAL
++        enddo
++
++        !--------------------------------------------------
++        !Reconstruct non-equlibrium distribution at interface
++        !--------------------------------------------------
++        !Load normal and tangential slopes through 1D velocity views.
++        do k=1,Nvel
++            shn_vec(k) = cell%sh_vec(k,idx)
++            sbn_vec(k) = cell%sb_vec(k,idx)
++
++            if (idx == 1) then ! normal is x, tangential is y
++                sht_vec(k) = cell%sh_vec(k,2)
++                sbt_vec(k) = cell%sb_vec(k,2)
++                !tan_len = cell%length(2) ! tangential length
++            else ! normal is y, tangential is x
++                sht_vec(k) = -cell%sh_vec(k,1)
++                sbt_vec(k) = -cell%sb_vec(k,1)
++                !tan_len = cell%length(1) ! tangential length
++            end if
++        enddo
++
++        !Limiter
++        ! calculaate the density change due to tangential slope
++        !d_rho_t = sum(weight*sht) * (0.5 * tan_len)
++        
++        ! If the density change > 50% of the center density, calculate a reduction factor phi
++        ! prim(1) is the density of the current cell
++        !prim = GetPrimary(cell%conVars) ! temporarily get for comparison
++        !
++        !if (abs(d_rho_t) > LIMIT_THRESHOLD * prim(1)) then
++        !    limiter_phi = (LIMIT_THRESHOLD * prim(1)) / (abs(d_rho_t) + EPS)
++        !else
++        !    limiter_phi = 1.0
++        !end if
++        
++        !sht = sht * limiter_phi
++        !sbt = sbt * limiter_phi
++        
++        ! if use tangential slope sht,sbt, all Mt(5) need change vn*sh to (vn*sh + vt*sht),vn*sb to (vn*sb + vt*sbt)
++
++        !Reconstruct incident non-equilibrium distribution at the wall.
++        do k=1,Nvel
++            h_vec(k) = cell%h_vec(k)-rot*0.5_KREAL*cell%length(idx)*shn_vec(k)
++            b_vec(k) = cell%b_vec(k)-rot*0.5_KREAL*cell%length(idx)*sbn_vec(k)
++        enddo
++
++        !Calculate primary variable of g_{i+1/2} in local frame
++        prim_w = LocalFrame(bc,face%cosx,face%cosy)
++        prim_g = prim_w
++        prim = LocalFrame(GetPrimary(cell%conVars),face%cosx,face%cosy)
++        prim_g(1) = prim(1)/prim(4)*prim_w(4) !keep consistent pressure inside cell
++
++        !--------------------------------------------------
++        !Calculate collision time and some time integration terms
++        !--------------------------------------------------
++        tau = GetTau(prim_g)
++
++        Mt(4) = tau*(1.0-exp(-dt/tau))
++        Mt(5) = -tau*dt*exp(-dt/tau)+tau*Mt(4)
++        Mt(1) = dt-Mt(4)
++        Mt(2) = -tau*Mt(1)+Mt(5) 
++        Mt(3) = 0.5*dt**2-tau*Mt(1)
++
++        !--------------------------------------------------
++        !1. Calculate Maxwellian distribution and Shakhov part at g_{i+1/2}
++        !--------------------------------------------------
++        do k=1,Nvel
++            H_g_vec(k)=prim_g(1)*(prim_g(4)/PI)*exp(-prim_g(4)* &
++                ((vn_vec(k)-prim_g(2))**2+(vt_vec(k)-prim_g(3))**2))
++            B_g_vec(k)=H_g_vec(k)*real(CK,KREAL)/(2.0_KREAL*prim_g(4))
++        enddo
++
++        qf = GetHeatFlux_LocalVec(h_vec,b_vec,vn_vec,vt_vec,prim_g)
++        call ShakhovPart_LocalVec(H_g_vec,B_g_vec,vn_vec,vt_vec,qf,prim_g,H_plus_vec,B_plus_vec)
++
++        !--------------------------------------------------
++        !2. Spatial slope a_g: derived from local gradients
++        !--------------------------------------------------
++        !sw = LocalFrame(cell%sw(:,idx), face%cosx, face%cosy) 
++        !a_g  = MicroSlope(prim_g, sw)
++        
++        !Alternative: derived from difference between cell center and interface
++        conVars_g = GetConserved(prim_g)
++        conVars_g1 = LocalFrame(cell%conVars, face%cosx, face%cosy)
++        sw = (conVars_g - conVars_g1) / (side * 0.5 * cell%length(idx))
++        a_gn  = MicroSlope(prim_g, sw)
++        
++        !if (idx == 1) then
++        !    sw_t = LocalFrame(cell%sw(:,2), face%cosx, face%cosy)
++        !else
++        !    sw_t = LocalFrame(-cell%sw(:,1), face%cosx, face%cosy) 
++        !end if
++        
++        !Tangential macro slope obtained by integrating reconstructed VDF slopes.
++        sw_t = 0.0_KREAL
++        do k=1,Nvel
++            wk  = wVel(k)
++            vnK = vn_vec(k)
++            vtK = vt_vec(k)
++            v2  = vnK*vnK+vtK*vtK
++
++            sw_t(1) = sw_t(1)+wk*sht_vec(k)
++            sw_t(2) = sw_t(2)+wk*vnK*sht_vec(k)
++            sw_t(3) = sw_t(3)+wk*vtK*sht_vec(k)
++            sw_t(4) = sw_t(4)+0.5_KREAL*wk*(v2*sht_vec(k)+sbt_vec(k))
++        enddo
++
++        a_gt = MicroSlope(prim_g, sw_t)
++        !--------------------------------------------------
++        !3. Temporal slope a_T
++        !--------------------------------------------------
++        call CalcMoment(prim_g, Mu, Mv, Mxi, MuL, MuR)
++        Mau = Moment_auvxi(a_gn, Mu, Mv, Mxi, 1, 0) 
++        Mbv = Moment_auvxi(a_gt, Mu, Mv, Mxi, 0, 1)
++        sw = -prim_g(1)*(Mau + Mbv) 
++        a_T = MicroSlope(prim_g, sw)
++        
++        !--------------------------------------------------
++        !4. Prepare expansion terms for Flux calculation
++        !--------------------------------------------------
++        !Ha_gn = (a_gn(1) + a_gn(2)*vn + a_gn(3)*vt)*H_g + 0.5*a_gn(4)*((vn**2+vt**2)*H_g + B_g)
++        !Ba_gn = (a_gn(1) + a_gn(2)*vn + a_gn(3)*vt)*B_g + 0.5*a_gn(4)*((vn**2+vt**2)*B_g + Mxi(2)*H_g)
++        !Ha_gt = (a_gt(1) + a_gt(2)*vn + a_gt(3)*vt)*H_g + 0.5*a_gt(4)*((vn**2+vt**2)*H_g + B_g)
++        !Ba_gt = (a_gt(1) + a_gt(2)*vn + a_gt(3)*vt)*B_g + 0.5*a_gt(4)*((vn**2+vt**2)*B_g + Mxi(2)*H_g)
++        !Ha_T  = (a_T(1) + a_T(2)*vn + a_T(3)*vt)*H_g + 0.5*a_T(4)*((vn**2+vt**2)*H_g + B_g)
++        !Ba_T  = (a_T(1) + a_T(2)*vn + a_T(3)*vt)*B_g + 0.5*a_T(4)*((vn**2+vt**2)*B_g + Mxi(2)*H_g)
++        
++
++        if (side == Lside) then
++            Mu = MuR
++        else
++            Mu = MuL
++        end if
++
++        Mau0 = Moment_uvxi(Mu,Mv,Mxi,1,0,0) !<u*\psi>
++        Mau = Moment_auvxi(a_gn,Mu,Mv,Mxi,2,0) !<a*u^2*\psi>
++        Mbv  = Moment_auvxi(a_gt,Mu,Mv,Mxi,1,1) !<b*u*v*\psi>
++        MauT = Moment_auvxi(a_T,Mu,Mv,Mxi,1,0) !<A*u*\psi>
++        
++        ! flux of Maxwellian part
++        flux = Mt(1)*prim_g(1)*Mau0+Mt(2)*prim_g(1)*(Mau+Mbv)+Mt(3)*prim_g(1)*MauT
++        !--------------------------------------------------
++        !Calculate wall density and Maxwellian distribution
++        !--------------------------------------------------
++        
++        !incidence = Mt(1)*sum(weight*vn*(H_g+H_plus)*(1-delta)) + &
++        !            Mt(2)*sum(weight*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + & 
++        !            Mt(3)*sum(weight*vn*Ha_T*(1-delta)) + &      
++        !            Mt(4)*sum(weight*vn*h*(1-delta)) - &
++        !            Mt(5)*sum(weight*vn*(vn*shn + vt*sht)*(1-delta))
++        
++        !Compute wall incidence/reflection using 1D velocity views.
++        incidence  = 0.0_KREAL
++        reflection = 0.0_KREAL
++        do k=1,Nvel
++            wk      = wVel(k)
++            vnK     = vn_vec(k)
++            vtK     = vt_vec(k)
++            deltaK  = delta_vec(k)
++            inflowK = 1.0_KREAL-deltaK
++            slope_hK = vnK*shn_vec(k)+vtK*sht_vec(k)
++            wallExpK = exp(-prim_w(4)*((vnK-prim_w(2))*(vnK-prim_w(2))+(vtK-prim_w(3))*(vtK-prim_w(3))))
++
++            Ha_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*H_g_vec(k) &
++                +0.5_KREAL*a_gn(4)*((vnK*vnK+vtK*vtK)*H_g_vec(k)+B_g_vec(k))
++            Ha_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*H_g_vec(k) &
++                +0.5_KREAL*a_gt(4)*((vnK*vnK+vtK*vtK)*H_g_vec(k)+B_g_vec(k))
++            Ha_TK = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*H_g_vec(k) &
++                +0.5_KREAL*a_T(4)*((vnK*vnK+vtK*vtK)*H_g_vec(k)+B_g_vec(k))
++            incidence = incidence+wk*vnK*inflowK*(Mt(1)*(H_g_vec(k)+H_plus_vec(k)) &
++                +Mt(2)*(vnK*Ha_gnK+vtK*Ha_gtK)+Mt(3)*Ha_TK+Mt(4)*h_vec(k)-Mt(5)*slope_hK)
++            reflection = reflection+wk*vnK*wallExpK*deltaK
++        enddo
++        reflection = dt*(prim_w(4)/PI)*reflection
++        prim_w(1) = -incidence/reflection
++
++        do k=1,Nvel
++            H_w_vec(k)=prim_w(1)*(prim_w(4)/PI)*exp(-prim_w(4)* &
++                ((vn_vec(k)-prim_w(2))**2+(vt_vec(k)-prim_w(3))**2))
++            B_w_vec(k)=H_w_vec(k)*real(CK,KREAL)/(2.0_KREAL*prim_w(4))
++        enddo
++
++        !--------------------------------------------------
++        ! Calculate Fluxes 
++        !--------------------------------------------------
++        ! 1. Mass Flux
++        !flux(1) = dt*sum(weight*vn*H_w*delta) + &
++        !          Mt(1)*sum(weight*vn*(H_g+H_plus)*(1-delta)) + &
++        !          Mt(2)*sum(weight*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta))+ &   
++        !          Mt(3)*sum(weight*vn*Ha_T*(1-delta)) + &        
++        !          Mt(4)*sum(weight*vn*h*(1-delta)) - &
++        !          Mt(5)*sum(weight*vn*(vn*shn + vt*sht)*(1-delta)) 
++        !Accumulate reflected and incident macro flux corrections through 1D velocity views.
++        flux_wall = 0.0_KREAL
++        do k=1,Nvel
++            wk      = wVel(k)
++            vnK     = vn_vec(k)
++            vtK     = vt_vec(k)
++            v2      = vnK*vnK+vtK*vtK
++            deltaK  = delta_vec(k)
++            inflowK = 1.0_KREAL-deltaK
++
++            H_wK     = H_w_vec(k)
++            B_wK     = B_w_vec(k)
++            H_plusK  = H_plus_vec(k)
++            B_plusK  = B_plus_vec(k)
++            hK       = h_vec(k)
++            bK       = b_vec(k)
++            slope_hK = vnK*shn_vec(k)+vtK*sht_vec(k)
++            slope_bK = vnK*sbn_vec(k)+vtK*sbt_vec(k)
++
++            flux_wall(1) = flux_wall(1)+wk*vnK*(dt*H_wK*deltaK+Mt(1)*H_plusK*inflowK+ &
++                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
++            flux_wall(2) = flux_wall(2)+wk*vnK*vnK*(dt*H_wK*deltaK+Mt(1)*H_plusK*inflowK+ &
++                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
++            flux_wall(3) = flux_wall(3)+wk*vnK*vtK*(dt*H_wK*deltaK+Mt(1)*H_plusK*inflowK+ &
++                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
++            flux_wall(4) = flux_wall(4)+0.5_KREAL*wk*vnK*(dt*(v2*H_wK+B_wK)*deltaK+ &
++                Mt(1)*(v2*H_plusK+B_plusK)*inflowK+Mt(4)*(v2*hK+bK)*inflowK- &
++                Mt(5)*(v2*slope_hK+slope_bK)*inflowK)
++        enddo
++        flux = flux+flux_wall
++
++        ! 2. Normal Momentum Flux
++        !flux(2) = dt*sum(weight*vn*vn*H_w*delta) + &
++        !          Mt(1)*sum(weight*vn*vn*(H_g+H_plus)*(1-delta)) + &
++        !          Mt(2)*sum(weight*vn*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + & 
++        !          Mt(3)*sum(weight*vn*vn*Ha_T*(1-delta)) + &     
++        !          Mt(4)*sum(weight*vn*vn*h*(1-delta)) - &
++        !          Mt(5)*sum(weight*vn*vn*(vn*shn + vt*sht)*(1-delta)) 
++        ! The Nvel loop above replaces the four separate macro-flux sum expressions.
++        ! 3. Tangential Momentum Flux
++        !flux(3) = dt*sum(weight*vn*vt*H_w*delta) + &
++        !          Mt(1)*sum(weight*vn*vt*(H_g+H_plus)*(1-delta)) + &
++        !          Mt(2)*sum(weight*vn*vt*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + & 
++        !          Mt(3)*sum(weight*vn*vt*Ha_T*(1-delta)) + &     
++        !          Mt(4)*sum(weight*vt*vn*h*(1-delta)) - &
++        !          Mt(5)*sum(weight*vt*vn*(vn*shn + vt*sht)*(1-delta)) 
++        ! The Nvel loop above replaces the tangential momentum flux sum.
++        ! 4. Energy Flux
++        !flux(4) = dt*0.5*sum(weight*vn*((vn**2+vt**2)*H_w+B_w)*delta)+ &
++        !          Mt(1)*0.5*sum(weight*vn*((vn**2+vt**2)*(H_g+H_plus)+(B_g+B_plus))*(1-delta))+ &
++        !          Mt(2)*0.5*sum(weight*vn*((vn**2+vt**2)*(vn*Ha_gn+vt*Ha_gt)+(vn*Ba_gn+vt*Ba_gt))*(1-delta))+ & 
++        !          Mt(3)*0.5*sum(weight*vn*((vn**2+vt**2)*Ha_T+Ba_T)*(1-delta))+ &      
++        !          Mt(4)*0.5*sum(weight*vn*((vn**2+vt**2)*h+b)*(1-delta)) - &
++        !          Mt(5)*0.5*sum(weight*vn*((vn**2+vt**2)*(vn*shn + vt*sht) + (vn*sbn + vt*sbt))*(1-delta))
++        ! The Nvel loop above replaces the energy flux sum.
++
++
++
++        !flux_h = dt*vn*H_w*delta + &
++        !         Mt(1)*vn*(H_g+H_plus)*(1-delta) + &
++        !         Mt(2)*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta) + &  
++        !         Mt(3)*vn*Ha_T*(1-delta) + &       
++        !         Mt(4)*vn*h*(1-delta) - &
++        !         Mt(5)*vn*(vn*shn + vt*sht)*(1-delta) 
++        
++        !Store multiscale wall micro flux directly through 1D face views.
++        do k=1,Nvel
++            vnK     = vn_vec(k)
++            vtK     = vt_vec(k)
++            v2      = vnK*vnK+vtK*vtK
++            deltaK  = delta_vec(k)
++            inflowK = 1.0_KREAL-deltaK
++
++            H_gK     = H_g_vec(k)
++            B_gK     = B_g_vec(k)
++            H_wK     = H_w_vec(k)
++            B_wK     = B_w_vec(k)
++            H_plusK  = H_plus_vec(k)
++            B_plusK  = B_plus_vec(k)
++            hK       = h_vec(k)
++            bK       = b_vec(k)
++            shnK     = shn_vec(k)
++            sbnK     = sbn_vec(k)
++            shtK     = sht_vec(k)
++            sbtK     = sbt_vec(k)
++
++            Ha_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*H_gK+0.5_KREAL*a_gn(4)*(v2*H_gK+B_gK)
++            Ha_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*H_gK+0.5_KREAL*a_gt(4)*(v2*H_gK+B_gK)
++            Ha_TK  = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*H_gK+0.5_KREAL*a_T(4)*(v2*H_gK+B_gK)
++
++            Ba_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*B_gK+0.5_KREAL*a_gn(4)*(v2*B_gK+Mxi(2)*H_gK)
++            Ba_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*B_gK+0.5_KREAL*a_gt(4)*(v2*B_gK+Mxi(2)*H_gK)
++            Ba_TK  = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*B_gK+0.5_KREAL*a_T(4)*(v2*B_gK+Mxi(2)*H_gK)
++
++            if(side==Lside) then
++                face%L_flux_h_vec(k) = face%length*(dt*vnK*H_wK*deltaK + &
++                    Mt(1)*vnK*(H_gK+H_plusK)*inflowK + Mt(2)*vnK*vnK*Ha_gnK*inflowK + &
++                    Mt(2)*vnK*vtK*Ha_gtK*inflowK + Mt(3)*vnK*Ha_TK*inflowK + &
++                    Mt(4)*vnK*hK*inflowK - Mt(5)*vnK*(vnK*shnK+vtK*shtK)*inflowK)
++
++                face%L_flux_b_vec(k) = face%length*(dt*vnK*B_wK*deltaK + &
++                    Mt(1)*vnK*(B_gK+B_plusK)*inflowK + Mt(2)*vnK*vnK*Ba_gnK*inflowK + &
++                    Mt(2)*vnK*vtK*Ba_gtK*inflowK + Mt(3)*vnK*Ba_TK*inflowK + &
++                    Mt(4)*vnK*bK*inflowK - Mt(5)*vnK*(vnK*sbnK+vtK*sbtK)*inflowK)
++            elseif(side==Rside) then
++                face%R_flux_h_vec(k) = face%length*(dt*vnK*H_wK*deltaK + &
++                    Mt(1)*vnK*(H_gK+H_plusK)*inflowK + Mt(2)*vnK*vnK*Ha_gnK*inflowK + &
++                    Mt(2)*vnK*vtK*Ha_gtK*inflowK + Mt(3)*vnK*Ha_TK*inflowK + &
++                    Mt(4)*vnK*hK*inflowK - Mt(5)*vnK*(vnK*shnK+vtK*shtK)*inflowK)
++
++                face%R_flux_b_vec(k) = face%length*(dt*vnK*B_wK*deltaK + &
++                    Mt(1)*vnK*(B_gK+B_plusK)*inflowK + Mt(2)*vnK*vnK*Ba_gnK*inflowK + &
++                    Mt(2)*vnK*vtK*Ba_gtK*inflowK + Mt(3)*vnK*Ba_TK*inflowK + &
++                    Mt(4)*vnK*bK*inflowK - Mt(5)*vnK*(vnK*sbnK+vtK*sbtK)*inflowK)
++            endif
++        enddo
++        !flux_b = dt*vn*B_w*delta + &
++        !         Mt(1)*vn*(B_g+B_plus)*(1-delta) + &
++        !         Mt(2)*vn*(vn*Ba_gn + vt*Ba_gt)*(1-delta) + &   
++        !         Mt(3)*vn*Ba_T*(1-delta) + &      
++        !         Mt(4)*vn*b*(1-delta) - &
++        !         Mt(5)*vn*(vn*sbn + vt*sbt)*(1-delta) 
++
++        !--------------------------------------------------
++        !Store surface FlowVars and Aerodynamics
++        !--------------------------------------------------
++        !Flow variables
++        
++        !conVars_g0(1) = dt*sum(weight*H_w*delta) + &
++        !                Mt(1)*sum(weight*(H_g+H_plus)*(1-delta)) + &
++        !                Mt(2)*sum(weight*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + &   
++        !                Mt(3)*sum(weight*Ha_T*(1-delta)) + &       
++        !                Mt(4)*sum(weight*h*(1-delta)) - &
++        !                Mt(5)*sum(weight*(vn*shn + vt*sht)*(1-delta)) 
++
++        !conVars_g0(2) = dt*sum(weight*vn*H_w*delta) + &
++        !                Mt(1)*sum(weight*vn*(H_g+H_plus)*(1-delta)) + &
++        !                Mt(2)*sum(weight*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + &
++        !                Mt(3)*sum(weight*vn*Ha_T*(1-delta)) + &    
++        !                Mt(4)*sum(weight*vn*h*(1-delta)) - &
++        !                Mt(5)*sum(weight*vn*(vn*shn + vt*sht)*(1-delta)) 
++
++        !conVars_g0(3) = dt*sum(weight*vt*H_w*delta) + &
++        !                Mt(1)*sum(weight*vt*(H_g+H_plus)*(1-delta)) + &
++        !                Mt(2)*sum(weight*vt*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + &
++        !                Mt(3)*sum(weight*vt*Ha_T*(1-delta)) + &    
++        !                Mt(4)*sum(weight*vt*h*(1-delta)) - &
++        !                Mt(5)*sum(weight*vt*(vn*shn + vt*sht)*(1-delta)) 
++
++        !conVars_g0(4) = dt*0.5*sum(weight*((vn**2+vt**2)*H_w+B_w)*delta)+ &
++        !                Mt(1)*0.5*sum(weight*((vn**2+vt**2)*(H_g+H_plus)+(B_g+B_plus))*(1-delta))+ &
++        !                Mt(2)*0.5*sum(weight*((vn**2+vt**2)*(vn*Ha_gn + vt*Ha_gt) + (vn*Ba_gn + vt*Ba_gt))*(1-delta))+ &
++        !                Mt(3)*0.5*sum(weight*((vn**2+vt**2)*Ha_T+Ba_T)*(1-delta))+ &      
++        !                Mt(4)*0.5*sum(weight*((vn**2+vt**2)*h+b)*(1-delta)) - &
++        !                Mt(5)*0.5*sum(weight*((vn**2+vt**2)*(vn*shn + vt*sht) + (vn*sbn + vt*sbt))*(1-delta))
++
++        ! Macro from the exact same time-and-length integrated micro flux.
++        flux=0.0_KREAL
++        do k=1,Nvel
++            if(side==Lside)then
++                hK=face%L_flux_h_vec(k)/face%length
++                bK=face%L_flux_b_vec(k)/face%length
++            else
++                hK=face%R_flux_h_vec(k)/face%length
++                bK=face%R_flux_b_vec(k)/face%length
++            endif
++            flux=flux+wVel(k)*[hK,vn_vec(k)*hK,vt_vec(k)*hK, &
++                0.5_KREAL*((vn_vec(k)**2+vt_vec(k)**2)*hK+bK)]
++        enddo
++        !Build wall output conserved variables through a single 1D velocity loop.
++        conVars_g0 = 0.0_KREAL
++        do k=1,Nvel
++            wk      = wVel(k)
++            vnK     = vn_vec(k)
++            vtK     = vt_vec(k)
++            v2      = vnK*vnK+vtK*vtK
++            deltaK  = delta_vec(k)
++            inflowK = 1.0_KREAL-deltaK
++
++            H_gK     = H_g_vec(k)
++            B_gK     = B_g_vec(k)
++            H_wK     = H_w_vec(k)
++            B_wK     = B_w_vec(k)
++            H_plusK  = H_plus_vec(k)
++            B_plusK  = B_plus_vec(k)
++            hK       = h_vec(k)
++            bK       = b_vec(k)
++            slope_hK = vnK*shn_vec(k)+vtK*sht_vec(k)
++            slope_bK = vnK*sbn_vec(k)+vtK*sbt_vec(k)
++
++            Ha_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*H_gK+0.5_KREAL*a_gn(4)*(v2*H_gK+B_gK)
++            Ha_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*H_gK+0.5_KREAL*a_gt(4)*(v2*H_gK+B_gK)
++            Ha_TK  = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*H_gK+0.5_KREAL*a_T(4)*(v2*H_gK+B_gK)
++
++            conVars_g0(1) = conVars_g0(1)+wk*(dt*H_wK*deltaK+Mt(1)*(H_gK+H_plusK)*inflowK+ &
++                Mt(2)*vnK*Ha_gnK*inflowK+Mt(2)*vtK*Ha_gtK*inflowK+Mt(3)*Ha_TK*inflowK+ &
++                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
++            conVars_g0(2) = conVars_g0(2)+wk*vnK*(dt*H_wK*deltaK+Mt(1)*(H_gK+H_plusK)*inflowK+ &
++                Mt(2)*vnK*Ha_gnK*inflowK+Mt(2)*vtK*Ha_gtK*inflowK+Mt(3)*Ha_TK*inflowK+ &
++                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
++            conVars_g0(3) = conVars_g0(3)+wk*vtK*(dt*H_wK*deltaK+Mt(1)*(H_gK+H_plusK)*inflowK+ &
++                Mt(2)*vnK*Ha_gnK*inflowK+Mt(2)*vtK*Ha_gtK*inflowK+Mt(3)*Ha_TK*inflowK+ &
++                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
++
++            !Keep the historical conVars_g0(4) algebra exactly; do not substitute the commented formula here.
++            conVars_g0(4) = conVars_g0(4)+0.5_KREAL*wk*(dt*(v2*H_wK+B_wK)*deltaK+ &
++                Mt(1)*(v2*(H_gK+H_plusK)+(B_gK+B_plusK))*inflowK+ &
++                Mt(2)*vnK*(v2*Ha_gnK+Ha_gtK*vtK)*inflowK+ &
++                Mt(2)*vtK*(v2*Ha_gnK+Ha_gtK*vtK)*inflowK+Mt(3)*v2*Ha_TK*inflowK+ &
++                Mt(4)*(v2*hK+bK)*inflowK-Mt(5)*(v2*slope_hK+slope_bK)*inflowK)
++        enddo
++        
++
++        prim_g0       = GlobalFrame(GetPrimary(conVars_g0/dt),face%cosx,face%cosy)
++        face%FlowVars(1:3)   = prim_g0(1:3)                         !density,u,v
++        face%FlowVars(4)     = 1.0/prim_g0(4)                       !temperature
++        face%FlowVars(5)     = 0.5*prim_g0(1)/prim_g0(4)            !pressure
++        !Aerodynamics (Notice: here assume Unw==0, i.e. prim_w(2)==0)
++        face%Aerodynamics(1) = flux(2)/dt                           !pnn: pressure
++        face%Aerodynamics(2) = flux(3)/dt                           !pnt: shear stress
++        face%Aerodynamics(3) = flux(4)/dt-prim_w(3)*flux(3)/dt      !qn:  heat flux
++
++        !--------------------------------------------------
++        !Final flux
++        !--------------------------------------------------
++        !Convert to global frame
++        
++        flux = GlobalFrame(flux,face%cosx,face%cosy)
++
++        !Total flux
++        flux = face%length*flux
++
++        if(side==Lside) then
++            face%L_flux     = flux
++        elseif(side==Rside) then
++            face%R_flux     = flux
++        endif
++        
++        !--------------------------------------------------
++        !Aftermath
++        !--------------------------------------------------
++        !Release pure 1D velocity-space temporaries allocated above.
++        deallocate(vn_vec)
++        deallocate(vt_vec)
++        deallocate(delta_vec)
++        deallocate(h_vec)
++        deallocate(b_vec)
++        deallocate(H_g_vec)
++        deallocate(B_g_vec)
++        deallocate(H_w_vec)
++        deallocate(B_w_vec)
++        deallocate(H_plus_vec)
++        deallocate(B_plus_vec)
++        deallocate(shn_vec)
++        deallocate(sbn_vec)
++        !deallocate(Ha_gn); deallocate(Ba_gn)
++        !deallocate(Ha_gt); deallocate(Ba_gt)
++        !deallocate(Ha_T); deallocate(Ba_T)
++        deallocate(sht_vec)
++        deallocate(sbt_vec)
++    end subroutine W2BMultiscaleFluxBoundary
++
+ end module mod_Evolution
+--- a/src/mod_Globaldata.f90
++++ b/src/mod_Globaldata.f90
+@@ -175,9 +175,12 @@
+     contains
+ 
+         pure logical function IsImplicitSteady()
+-            IsImplicitSteady = trim(adjustl(TimeIntegration_method)) == 'ImplicitSteady'
++            IsImplicitSteady = trim(adjustl(TimeIntegration_method)) == 'ImplicitSteady'.or.IsHighOrderImplicit()
+         end function IsImplicitSteady
+ 
++        pure logical function IsHighOrderImplicit()
++            IsHighOrderImplicit=trim(adjustl(TimeIntegration_method))=='HighOrderImplicit'
++        end function
+         pure logical function IsS2Steady()
+             IsS2Steady = trim(adjustl(TimeIntegration_method)) == 'S2Steady'
+         end function IsS2Steady
+@@ -243,6 +246,23 @@
+         integer(KINT)                       :: BG_geometry              !0: general, 1:flat plate
+         real(KREAL)                         :: ACC                      !Accommodation coefficient at the solid wall 
+     
++        ! Optional Couette inputs. Defaults preserve the original stationary-wall path.
++        real(KREAL) :: CouetteMuRef = -1.0_KREAL
++        real(KREAL) :: WallUx(4) = 0.0_KREAL
++        character(len=256) :: StructuredVelocityFile = ''
++        logical :: CouetteUseW2BWall = .false.
++        logical :: Implicit_ClosedMassConstraint = .false.
++        logical :: Implicit_ZhuMovingWall = .false.
++        logical :: Implicit_InitHaloResync = .false.
++        logical :: ClosedCouetteMassRescale = .false.
++        logical :: UnifiedPhysicalOperators=.false.
++    contains
++        function WallPrimary(side) result(p)
++            integer, intent(in) :: side
++            real(KREAL) :: p(4)
++            p=Prim_wall
++            p(2)=WallUx(side)
++        end function WallPrimary
+     end module flow_para
+     
+     
+--- a/src/mod_ImplicitBoundary.f90
++++ b/src/mod_ImplicitBoundary.f90
+@@ -7,7 +7,7 @@
+     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+     implicit none
+     private
+-    public :: BuildStructuredMirrorMaps, GetMacroBoundaryDelta
++    public :: BuildStructuredMirrorMaps, GetMacroBoundaryDelta, ZhuMovingWallMap
+     public :: GetSymmetryMicroDelta, GetSymmetryMicroValue, ComputeDiffuseWallFaceDelta
+     public :: ComputeMaxwellWallFaceDelta
+     public :: ResolveImplicitBoundaryType, IsAxisAlignedSymmetryNormal
+@@ -182,12 +182,24 @@
+         call MPI_Abort(MPI_COMM_WORLD, 202, ierr)
+     end subroutine AbortMirrorMap
+ 
+-    subroutine GetMacroBoundaryDelta(boundary_type,nx_face,ny_face,delta_inner,delta_boundary,ok)
++    ! W=[rho,rho*U,rho*V,rho*E]. The linear map is both Eq.(28)'s ghost state
++    ! (equal pressure/internal energy) and its exact tangent, Eq.(29), Zhu et al. 2016.
++    pure function ZhuMovingWallMap(w,uw,vw) result(ghost)
++        real(KREAL), intent(in) :: w(4),uw,vw
++        real(KREAL) :: ghost(4)
++        ghost(1)=w(1)
++        ghost(2)=2.0_KREAL*uw*w(1)-w(2)
++        ghost(3)=2.0_KREAL*vw*w(1)-w(3)
++        ghost(4)=w(4)+2.0_KREAL*(uw*uw+vw*vw)*w(1)-2.0_KREAL*uw*w(2)-2.0_KREAL*vw*w(3)
++    end function ZhuMovingWallMap
++
++    subroutine GetMacroBoundaryDelta(boundary_type,nx_face,ny_face,delta_inner,delta_boundary,ok,face_number)
+         integer(KINT), intent(in) :: boundary_type
+         real(KREAL), intent(in) :: nx_face, ny_face, delta_inner(4)
+         real(KREAL), intent(out) :: delta_boundary(4)
+         logical, intent(out) :: ok
+-        real(KREAL) :: normal_momentum
++        integer(KINT), intent(in), optional :: face_number
++        real(KREAL) :: normal_momentum,wall_prim(4)
+ 
+         ok=.true.
+         select case(boundary_type)
+@@ -195,7 +207,21 @@
+             delta_boundary=0.0_KREAL
+         case(BCconst_extrapolation)
+             delta_boundary=delta_inner
+-        case(BCconst_symmetry,BCconst_wall_isothermal)
++        case(BCconst_wall_isothermal)
++            if (Implicit_ZhuMovingWall) then
++                ok=.false.; delta_boundary=0.0_KREAL
++                if (.not.present(face_number)) return
++                if (face_number<1 .or. face_number>4) return
++                wall_prim=WallPrimary(face_number)
++                delta_boundary=ZhuMovingWallMap(delta_inner,wall_prim(2),wall_prim(3))
++                ok=.true.
++            else
++                delta_boundary=delta_inner
++                normal_momentum=delta_inner(2)*nx_face+delta_inner(3)*ny_face
++                delta_boundary(2)=delta_inner(2)-2.0_KREAL*normal_momentum*nx_face
++                delta_boundary(3)=delta_inner(3)-2.0_KREAL*normal_momentum*ny_face
++            endif
++        case(BCconst_symmetry)
+             delta_boundary=delta_inner
+             normal_momentum=delta_inner(2)*nx_face+delta_inner(3)*ny_face
+             delta_boundary(2)=delta_inner(2)-2.0_KREAL*normal_momentum*nx_face
+--- a/src/mod_ImplicitDiagnostics.f90
++++ b/src/mod_ImplicitDiagnostics.f90
+@@ -10,7 +10,7 @@
+     use, intrinsic :: iso_fortran_env, only: output_unit
+     implicit none
+     private
+-    public :: InitializeImplicitDiagnostics, UpdateImplicitResidualDiagnostics
++    public :: InitializeImplicitDiagnostics, UpdateImplicitResidualDiagnostics, GetImplicitReferences, InheritImplicitReferences
+     public :: ImplicitConverged, WriteImplicitResidual, AbortSteadyImplicit
+     public :: CollectImplicitTimingMaxima
+     public :: AcceptedStateAdmissibilityDiagnostics, CollectAcceptedStateAdmissibilityDiagnostics
+@@ -243,6 +243,18 @@
+             prim=GetPrimary(ctr(i,j)%conVars)
+             tau_value=GetTau(prim)
+             q_current=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)
++            if(UnifiedPhysicalOperators)then
++                block
++                    use mod_ImplicitState,only:peh=>physical_equilibrium_h,peb=>physical_equilibrium_b, &
++                        pch=>physical_collision_h,pcb=>physical_collision_b
++                    physical_equilibrium_h=peh(:,i,j);physical_equilibrium_b=peb(:,i,j)
++                    do k=1,Nvel
++                        dh=stream_h(k,i,j)+pch(k,i,j);db=stream_b(k,i,j)+pcb(k,i,j)
++                        micro_sums_local(1)=micro_sums_local(1)+ctr(i,j)%area*wVel(k)*dh*dh
++                        micro_sums_local(2)=micro_sums_local(2)+ctr(i,j)%area*wVel(k)*db*db
++                    enddo
++                end block
++            else
+             call DiscreteMaxwell_Vec(physical_equilibrium_h,physical_equilibrium_b,prim)
+             call ShakhovPart_Vec(physical_equilibrium_h,physical_equilibrium_b,q_current,prim,h_plus,b_plus)
+             physical_equilibrium_h=physical_equilibrium_h+h_plus
+@@ -260,6 +272,7 @@
+                 micro_sums_local(1)=micro_sums_local(1)+ctr(i,j)%area*wVel(k)*dh*dh
+                 micro_sums_local(2)=micro_sums_local(2)+ctr(i,j)%area*wVel(k)*db*db
+             enddo
++            endif
+             micro_sums_local(3)=micro_sums_local(3)+ctr(i,j)%area*sum(wVel* &
+                 max(ctr(i,j)%h_vec**2,physical_equilibrium_h**2))
+             micro_sums_local(4)=micro_sums_local(4)+ctr(i,j)%area*sum(wVel* &
+@@ -275,6 +288,7 @@
+         call MPI_Allreduce(mass_local,mass_global,1,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
+         implicit_macro_relative=sqrt(real(Nx_all*Ny_all,KREAL)*macro_num_global)/(macro_den_global+SMV)
+         implicit_macro_absolute=sqrt(macro_num_global/max(macro_weight_global,SMV))
++        r5_raw_h=sqrt(micro_sums_global(1));r5_raw_b=sqrt(micro_sums_global(2))
+         ordinary_macro_scale=max(macro_den_global(1),macro_den_global(4),SMV)
+         do k=1,4
+             if (IsNearZeroResidualScale(macro_den_global(k),ordinary_macro_scale)) then
+@@ -306,6 +320,20 @@
+         implicit_h_norm=RelativeOrAbsoluteResidual(h_raw,reference_h,near_zero_micro_reference)
+         implicit_b_norm=RelativeOrAbsoluteResidual(b_raw,reference_b,near_zero_micro_reference)
+     end subroutine UpdateImplicitResidualDiagnostics
++
++    ! R6 restart wiring only: inherit the native R5 micro reference epoch.
++    ! Residual formulas, current-state macro denominators and numerical updates are unchanged.
++    subroutine InheritImplicitReferences(h,b)
++        real(KREAL),intent(in) :: h,b
++        if (.not.ieee_is_finite(h) .or. .not.ieee_is_finite(b) .or. h<=0.0_KREAL .or. b<=0.0_KREAL) &
++            call AbortSteadyImplicit('invalid inherited residual references')
++        reference_h=h;reference_b=b;references_initialized=.true.
++    end subroutine
++
++    subroutine GetImplicitReferences(h,b)
++        real(KREAL),intent(out) :: h,b
++        h=reference_h;b=reference_b
++    end subroutine
+ 
+     logical function ImplicitConverged()
+         ImplicitConverged=all(implicit_macro_residual<=Implicit_ResidualTol) .and. &
+--- a/src/mod_ImplicitMacro.f90
++++ b/src/mod_ImplicitMacro.f90
+@@ -1,9 +1,9 @@
+ module mod_ImplicitMacro
+     use flow_data
+     use Tools, only: GetPrimary, GetTau
+-    use mod_ImplicitState, only: rate_w, delta_w, w_tilde, implicit_ncfl_active
++    use mod_ImplicitState, only: rate_w, delta_w, w_tilde, implicit_ncfl_active,macro_pr_passes
+     use mod_ImplicitCommon, only: IsPhysicalState, EulerFluxNormal, PseudoTimeStep
+-    use mod_ImplicitBoundary, only: GetMacroBoundaryDelta, ResolveImplicitBoundaryType
++    use mod_ImplicitBoundary, only: GetMacroBoundaryDelta, ResolveImplicitBoundaryType, ZhuMovingWallMap
+     use mpi_wrapper, only: MPIExchangeDeltaMacro
+     use mpi
+     use, intrinsic :: ieee_arithmetic
+@@ -17,7 +17,8 @@
+         integer(KINT) :: ni,nj,boundary_type
+         logical :: physical_boundary
+         real(KREAL) :: nx_out,ny_out,face_length,projected_distance
+-        real(KREAL) :: wi(4),wj(4),primi(4),primj(4)
++        real(KREAL) :: wi(4),wj(4),primi(4),primj(4),wall_prim(4)
++        integer(KINT) :: face_number
+         real(KREAL) :: rhoi,rhoj,rho_avg,u_avg,v_avg,p_i,p_j,p_avg
+         real(KREAL) :: tau_i,tau_j,mu_avg,sound_speed
+ 
+@@ -26,6 +27,12 @@
+         wi=ctr(i,j)%conVars
+         if (physical_boundary) then
+             wj=wi
++            if (Implicit_ZhuMovingWall .and. boundary_type==BCconst_wall_isothermal) then
++                face_number=2*(dirc-1)+1
++                if (side==Rside) face_number=face_number+1
++                wall_prim=WallPrimary(face_number)
++                wj=ZhuMovingWallMap(wi,wall_prim(2),wall_prim(3))
++            endif
+             projected_distance=ctr(i,j)%length(dirc)
+         else
+             wj=ctr(ni,nj)%conVars
+@@ -39,11 +46,7 @@
+         p_i=0.5_KREAL*primi(1)/primi(4)
+         p_j=0.5_KREAL*primj(1)/primj(4)
+         p_avg=0.5_KREAL*(p_i+p_j)
+-        if(IsS2Steady())then
+-            tau_i=0.1_KREAL;tau_j=0.1_KREAL
+-        else
+-            tau_i=GetTau(primi);tau_j=GetTau(primj)
+-        endif
++        tau_i=GetTau(primi); tau_j=GetTau(primj)
+         mu_avg=0.5_KREAL*(tau_i*p_i+tau_j*p_j)
+         sound_speed=sqrt(gamma*p_avg/rho_avg)
+         gamma_face=abs(u_avg*nx_out+v_avg*ny_out)+sound_speed+ &
+@@ -61,6 +64,7 @@
+         ok=.false.
+         call MPIExchangeDeltaMacro(delta_w)
+         do sweep=1,Implicit_MacroSweeps
++            macro_pr_passes=macro_pr_passes+1
+             local_ok=.true.
+             do j=1,ny
+                 do i=1,nx
+@@ -187,7 +191,7 @@
+         logical, intent(out) :: ok
+         integer(KINT) :: dirc,side,ni,nj,boundary_type
+         logical :: physical_boundary
+-        real(KREAL) :: nx_out,ny_out,wi(4),wj(4),flux_old(4),flux_new(4),delta_t_i(4),delta_t_j(4)
++        real(KREAL) :: nx_out,ny_out,wi(4),wj(4),flux_old(4),flux_new(4),delta_t_i(4),delta_t_j(4),wall_prim(4)
+ 
+         call FaceNumberToDirection(face_number,dirc,side)
+         call GetFaceGeometry(i,j,dirc,side,ni,nj,nx_out,ny_out,face_length, &
+@@ -195,7 +199,11 @@
+         wi=ctr(i,j)%conVars
+         if (physical_boundary) then
+             wj=wi
+-            call GetMacroBoundaryDelta(boundary_type,nx_out,ny_out,delta_w(:,i,j),delta_neighbor,ok)
++            if (Implicit_ZhuMovingWall .and. boundary_type==BCconst_wall_isothermal) then
++                wall_prim=WallPrimary(face_number)
++                wj=ZhuMovingWallMap(wi,wall_prim(2),wall_prim(3))
++            endif
++            call GetMacroBoundaryDelta(boundary_type,nx_out,ny_out,delta_w(:,i,j),delta_neighbor,ok,face_number)
+             if (.not.ok) return
+         else
+             wj=ctr(ni,nj)%conVars
+--- a/src/mod_ImplicitMicro.f90
++++ b/src/mod_ImplicitMicro.f90
+@@ -45,9 +45,7 @@
+         integer(KINT) :: i,j
+         real(KREAL) :: prim_old(4),prim_tilde(4),h_plus(Nvel),b_plus(Nvel)
+         real(KREAL) :: reference_h(Nvel),reference_b(Nvel)
+-        real(KREAL) :: old_equilibrium_h(Nvel),old_equilibrium_b(Nvel)
+-        real(KREAL) :: old_reference_h(Nvel),old_reference_b(Nvel)
+-        logical :: projection_ok
++        logical :: projection_ok,old_projection_ok
+         logical :: local_ok,global_ok
+ 
+         local_ok=.true.
+@@ -56,11 +54,7 @@
+                 prim_old=GetPrimary(ctr(i,j)%conVars)
+                 q_frozen(:,i,j)=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim_old)
+                 prim_tilde=GetPrimary(w_tilde(:,i,j))
+-                if(s2_steady_rhs)then
+-                    tau_tilde(i,j)=0.1_KREAL
+-                else
+-                    tau_tilde(i,j)=GetTau(prim_tilde)
+-                endif
++                tau_tilde(i,j)=GetTau(prim_tilde)
+                 call DiscreteMaxwell_Vec(equilibrium_h(:,i,j),equilibrium_b(:,i,j),prim_tilde)
+                 call ShakhovPart_Vec(equilibrium_h(:,i,j),equilibrium_b(:,i,j),q_frozen(:,i,j), &
+                                      prim_tilde,h_plus,b_plus)
+@@ -69,19 +63,19 @@
+                 reference_h=equilibrium_h(:,i,j); reference_b=equilibrium_b(:,i,j)
+                 call ProjectToConservedMoments(equilibrium_h(:,i,j),equilibrium_b(:,i,j), &
+                     w_tilde(:,i,j),uVel,vVel,wVel,reference_h,reference_b,projection_ok)
+-                if(s2_steady_rhs.and.projection_ok)then
+-                    call DiscreteMaxwell_Vec(old_equilibrium_h,old_equilibrium_b,prim_old)
+-                    call ShakhovPart_Vec(old_equilibrium_h,old_equilibrium_b,q_frozen(:,i,j), &
+-                        prim_old,h_plus,b_plus)
+-                    old_equilibrium_h=old_equilibrium_h+h_plus
+-                    old_equilibrium_b=old_equilibrium_b+b_plus
+-                    old_reference_h=old_equilibrium_h;old_reference_b=old_equilibrium_b
+-                    call ProjectToConservedMoments(old_equilibrium_h,old_equilibrium_b, &
+-                        ctr(i,j)%conVars,uVel,vVel,wVel,old_reference_h,old_reference_b,projection_ok)
+-                    if(projection_ok)then
+-                        equilibrium_increment_h(:,i,j)=equilibrium_h(:,i,j)-old_equilibrium_h
+-                        equilibrium_increment_b(:,i,j)=equilibrium_b(:,i,j)-old_equilibrium_b
+-                    endif
++                if(IsHighOrderImplicit())then
++                    call DiscreteMaxwell_Vec(reference_h,reference_b,prim_old)
++                    call ShakhovPart_Vec(reference_h,reference_b,q_frozen(:,i,j),prim_old,h_plus,b_plus)
++                    reference_h=reference_h+h_plus;reference_b=reference_b+b_plus
++                    block
++                        real(KREAL)::rh(Nvel),rb(Nvel)
++                        rh=reference_h;rb=reference_b
++                        call ProjectToConservedMoments(reference_h,reference_b,ctr(i,j)%conVars, &
++                            uVel,vVel,wVel,rh,rb,old_projection_ok)
++                    end block
++                    local_ok=local_ok.and.old_projection_ok
++                    low_collision_old_h(:,i,j)=(reference_h-ctr(i,j)%h_vec)/GetTau(prim_old)
++                    low_collision_old_b(:,i,j)=(reference_b-ctr(i,j)%b_vec)/GetTau(prim_old)
+                 endif
+                 local_ok=local_ok .and. tau_tilde(i,j)>0.0_KREAL .and. &
+                     projection_ok .and. &
+@@ -384,6 +378,7 @@
+         freeze_wall_closure_active=.false.
+         if (present(freeze_wall_closure)) freeze_wall_closure_active=freeze_wall_closure
+         do sweep=1,Implicit_MicroSweeps
++            r4_forward_scans=r4_forward_scans+1
+             local_ok=.true.
+             start_stage=MPI_Wtime()
+             do j=1,ny
+@@ -411,8 +406,8 @@
+             implicit_micro_forward_backward_exchange_seconds= &
+                 implicit_micro_forward_backward_exchange_seconds+MPI_Wtime()-start_stage
+             implicit_micro_exchange_calls=implicit_micro_exchange_calls+1
+-            if(s2_steady_rhs)call RecordR1MicroForward(sweep)
+             start_stage=MPI_Wtime()
++            r4_backward_scans=r4_backward_scans+1
+             do j=ny,1,-1
+                 do i=nx,1,-1
+                     if (freeze_wall_closure_active) then
+@@ -446,33 +441,6 @@
+         ok=.true.
+     end subroutine SolveMicroLUSGS
+ 
+-    subroutine RecordR1MicroForward(sweep)
+-        integer,intent(in)::sweep
+-        real(KREAL)::mom(4),tot(4),hdef,bdef
+-        integer::i,j,env_status,fu
+-        character(len=8)::env_value
+-        logical,save::opened=.false.
+-        env_value=''
+-        call get_environment_variable('S2I1_R1_DIAG',env_value,status=env_status)
+-        if(env_status/=0.or.trim(env_value)/='1')return
+-        tot=0.0_KREAL
+-        do j=1,ny;do i=1,nx
+-            call MomentConserved(delta_h(:,i,j),delta_b(:,i,j),uVel,vVel,wVel,mom)
+-            tot=tot+ctr(i,j)%area*mom
+-        enddo;enddo
+-        call ComputeMicroDefectNorm(hdef,bdef)
+-        if(myID==0)then
+-            if(.not.opened)then
+-                open(newunit=fu,file='s2i1_micro_forward.csv',status='replace',action='write')
+-                write(fu,'(A)')'iter,retry,sweep,dMf_sum1,dMf_sum2,dMf_sum3,dMf_sum4,h_linear_defect,b_linear_defect'
+-                close(fu);opened=.true.
+-            endif
+-            open(newunit=fu,file='s2i1_micro_forward.csv',status='old',position='append',action='write')
+-            write(fu,'(I0,",",I0,",",I0,6(",",ES24.16))')iter,implicit_retry_count,sweep,tot,hdef,bdef
+-            close(fu)
+-        endif
+-    end subroutine RecordR1MicroForward
+-
+     subroutine RelaxMicroPoint(i,j,k,ok,physical_dt,flux_weight,collision_weight,wall_state)
+         integer(KINT), intent(in) :: i,j,k
+         logical, intent(out) :: ok
+@@ -494,17 +462,11 @@
+             stream_coefficient=1.0_KREAL
+             collision_coefficient=1.0_KREAL
+             dt_pseudo=PseudoTimeStep(ctr(i,j)%dt_local,implicit_ncfl_active,CFL)
+-            if(s2_steady_rhs)then
+-                if(s2_steady_coupling_on)then
+-                    rhs_h=stream_h(k,i,j)+equilibrium_increment_h(k,i,j)/tau_tilde(i,j)
+-                    rhs_b=stream_b(k,i,j)+equilibrium_increment_b(k,i,j)/tau_tilde(i,j)
+-                else
+-                    rhs_h=stream_h(k,i,j)
+-                    rhs_b=stream_b(k,i,j)
+-                endif
+-            else
+-                rhs_h=stream_h(k,i,j)+(equilibrium_h(k,i,j)-ctr(i,j)%h_vec(k))/tau_tilde(i,j)
+-                rhs_b=stream_b(k,i,j)+(equilibrium_b(k,i,j)-ctr(i,j)%b_vec(k))/tau_tilde(i,j)
++            rhs_h=stream_h(k,i,j)+(equilibrium_h(k,i,j)-ctr(i,j)%h_vec(k))/tau_tilde(i,j)
++            rhs_b=stream_b(k,i,j)+(equilibrium_b(k,i,j)-ctr(i,j)%b_vec(k))/tau_tilde(i,j)
++            if(IsHighOrderImplicit())then
++                rhs_h=rhs_h+physical_collision_h(k,i,j)-low_collision_old_h(k,i,j)
++                rhs_b=rhs_b+physical_collision_b(k,i,j)-low_collision_old_b(k,i,j)
+             endif
+             diagonal=1.0_KREAL/dt_pseudo+1.0_KREAL/tau_tilde(i,j)
+         endif
+@@ -573,6 +535,13 @@
+             dt_pseudo,tau_value])) .or. dt_pseudo<=0.0_KREAL .or. tau_value<=0.0_KREAL) return
+ 
+         collision_rhs=(equilibrium_value-current_value)/tau_value
++        if(IsHighOrderImplicit())then
++            if(is_h)then
++                collision_rhs=collision_rhs+physical_collision_h(k,i,j)-low_collision_old_h(k,i,j)
++            else
++                collision_rhs=collision_rhs+physical_collision_b(k,i,j)-low_collision_old_b(k,i,j)
++            endif
++        endif
+         area=ctr(i,j)%area
+         if (.not.ieee_is_finite(area) .or. area<=0.0_KREAL) return
+         neighbor_rhs=0.0_KREAL
+@@ -617,18 +586,17 @@
+         dt_pseudo=PseudoTimeStep(ctr(i,j)%dt_local,implicit_ncfl_active,CFL)
+         if (is_h) then
+             rhs=stream_h(k,i,j)+(equilibrium_h(k,i,j)-ctr(i,j)%h_vec(k))/tau_tilde(i,j)
+-            if(s2_steady_rhs)then
+-                rhs=stream_h(k,i,j)
+-                if(s2_steady_coupling_on)rhs=rhs+equilibrium_increment_h(k,i,j)/tau_tilde(i,j)
+-            endif
+             current_delta=delta_h(k,i,j)
+         else
+             rhs=stream_b(k,i,j)+(equilibrium_b(k,i,j)-ctr(i,j)%b_vec(k))/tau_tilde(i,j)
+-            if(s2_steady_rhs)then
+-                rhs=stream_b(k,i,j)
+-                if(s2_steady_coupling_on)rhs=rhs+equilibrium_increment_b(k,i,j)/tau_tilde(i,j)
+-            endif
+             current_delta=delta_b(k,i,j)
++        endif
++        if(IsHighOrderImplicit())then
++            if(is_h)then
++                rhs=rhs+physical_collision_h(k,i,j)-low_collision_old_h(k,i,j)
++            else
++                rhs=rhs+physical_collision_b(k,i,j)-low_collision_old_b(k,i,j)
++            endif
+         endif
+         lhs=current_delta*(1.0_KREAL/dt_pseudo+1.0_KREAL/tau_tilde(i,j))
+         do face_number=1,4
+@@ -731,11 +699,11 @@
+             endif
+             !Build the complete wall correction once; all velocity points in this cell sweep reuse it.
+             if (FluxWall_type==FluxWall_Maxwell) then
+-                call ComputeMaxwellWallFaceDelta(Prim_wall,nx_out,ny_out,side,ACC, &
++                call ComputeMaxwellWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side,ACC, &
+                     delta_h(:,i,j),delta_b(:,i,j),state%delta_h_face(:,face_number), &
+                     state%delta_b_face(:,face_number),rho_delta,face_ok)
+             else
+-                call ComputeDiffuseWallFaceDelta(Prim_wall,nx_out,ny_out,side, &
++                call ComputeDiffuseWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side, &
+                     delta_h(:,i,j),delta_b(:,i,j),state%delta_h_face(:,face_number), &
+                     state%delta_b_face(:,face_number),rho_delta,face_ok)
+             endif
+@@ -807,10 +775,10 @@
+                 endif
+             endif
+             if (FluxWall_type==FluxWall_Maxwell) then
+-                call ComputeMaxwellWallFaceDelta(Prim_wall,nx_out,ny_out,side,ACC, &
++                call ComputeMaxwellWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side,ACC, &
+                     delta_h(:,i,j),delta_b(:,i,j),dh_boundary,db_boundary,rho_delta,ok)
+             else
+-                call ComputeDiffuseWallFaceDelta(Prim_wall,nx_out,ny_out,side, &
++                call ComputeDiffuseWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side, &
+                     delta_h(:,i,j),delta_b(:,i,j),dh_boundary,db_boundary,rho_delta,ok)
+             endif
+             if (ok) then
+--- a/src/mod_ImplicitState.f90
++++ b/src/mod_ImplicitState.f90
+@@ -71,6 +71,12 @@
+         real(KREAL) :: post_sweep_delta=0.0_KREAL
+     end type ImplicitFailureRecord
+ 
++    integer :: r4_forward_scans=0,r4_backward_scans=0,macro_pr_passes=0
++    logical :: r5_force_true_updates=.false.
++    real(KREAL) :: r5_macro_alpha=1.0_KREAL,r5_raw_h=0.0_KREAL,r5_raw_b=0.0_KREAL
++    real(KREAL), allocatable :: physical_collision_h(:,:,:),physical_collision_b(:,:,:)
++    real(KREAL), allocatable :: physical_equilibrium_h(:,:,:),physical_equilibrium_b(:,:,:)
++    real(KREAL), allocatable :: low_collision_old_h(:,:,:),low_collision_old_b(:,:,:)
+     type(ImplicitFailureRecord) :: implicit_failure
+     real(KREAL), allocatable :: rate_w(:,:,:)
+     real(KREAL), allocatable :: stream_h(:,:,:), stream_b(:,:,:)
+@@ -111,6 +117,12 @@
+         allocate(equilibrium_h(Nvel,1:nx,1:ny), equilibrium_b(Nvel,1:nx,1:ny))
+         allocate(equilibrium_increment_h(Nvel,1:nx,1:ny),equilibrium_increment_b(Nvel,1:nx,1:ny))
+         if (.not.allocated(mirror_u_index)) allocate(mirror_u_index(Nvel), mirror_v_index(Nvel))
++        allocate(physical_collision_h(Nvel,nx,ny),physical_collision_b(Nvel,nx,ny))
++        allocate(physical_equilibrium_h(Nvel,nx,ny),physical_equilibrium_b(Nvel,nx,ny))
++        allocate(low_collision_old_h(Nvel,nx,ny),low_collision_old_b(Nvel,nx,ny))
++        physical_collision_h=0;physical_collision_b=0
++        physical_equilibrium_h=0;physical_equilibrium_b=0
++        low_collision_old_h=0;low_collision_old_b=0
+         call ResetImplicitCorrections()
+         rate_w=0.0_KREAL; stream_h=0.0_KREAL; stream_b=0.0_KREAL
+         w_tilde=0.0_KREAL; tau_tilde=0.0_KREAL; q_frozen=0.0_KREAL
+--- a/src/mod_ImportPara.f90
++++ b/src/mod_ImportPara.f90
+@@ -142,14 +142,16 @@
+                           Quadrature_method, TimeStep_method, TimeIntegration_method, PeriodicComparisonProfile, &
+                           Implicit_nCFL, Implicit_MacroSweeps, Implicit_MicroSweeps, &
+                           Implicit_ResidualTol, Implicit_MomentTol, Implicit_MinAlpha, &
+-                          Implicit_MaxRetries, Implicit_MaxIter, &
++                          Implicit_MaxRetries, Implicit_MaxIter, UnifiedPhysicalOperators, &
++                          CouetteMuRef,StructuredVelocityFile,Implicit_ClosedMassConstraint, &
++                          Implicit_ZhuMovingWall,Implicit_InitHaloResync,ClosedCouetteMassRescale, &
+                           Unsteady_Theta, Unsteady_InnerTol, Unsteady_MaxInner, &
+                           Iflag_InitFlow, Iflag_WriteSurf, Iflag_WriteRestart, S2D1_initial_mode, &
+                           S2W1_wall_mode,S2W1_time_centered,S2W1D_face_time_consistent,S2W2R_shared_predictor, &
+                           S2W1_wall_ux,S2W1_wall_theta,S2PhysicalGas,S2_mu_ref, &
+                           S2WallTNative,S2VelocityTable,S2VelocityScale,S2CartesianMesh,S2Diagnostics,S2CheckpointImport, &
+                           Nx_all, Ny_all, Nu, Nv, U_MIN, U_MAX, V_MIN, V_MAX, NP_X, NP_Y
+-        namelist /boundary_para/ BC_Type, BG_geometry, FluxWall_type, ACC
++        namelist /boundary_para/ BC_Type, BG_geometry, FluxWall_type, ACC, WallUx, CouetteUseW2BWall
+ 
+         call CheckDuplicateS2Walls()
+         open(1, file="Config.ini")
+@@ -158,6 +160,10 @@
+         read(1, nml=boundary_para,iostat=ierr)
+         if(ierr/=0)call AbortInvalidImplicitOption('Config.ini boundary namelist parse failure')
+         close(1)
++        if(UnifiedPhysicalOperators)then
++            S2_mu_ref=CouetteMuRef
++            S2W1_wall_ux=WallUx(3:4)
++        endif
+         call ResolveS2WallTemperatures()
+     end subroutine ReadBaseParameters
+ 
+@@ -360,6 +366,30 @@
+         integer::rect_status
+         character(len=8)::rect_flag
+         logical::rect_enabled
++        if(IsHighOrderImplicit().and..not.UnifiedPhysicalOperators) &
++            call AbortInvalidImplicitOption('HighOrderImplicit requires UnifiedPhysicalOperators')
++        if(IsHighOrderImplicit())then
++            if(.not.ieee_is_finite(Implicit_nCFL).or.Implicit_nCFL<=0.0_KREAL.or. &
++                .not.ieee_is_finite(Implicit_ResidualTol).or.Implicit_ResidualTol<=0.0_KREAL.or. &
++                .not.ieee_is_finite(Implicit_MomentTol).or.Implicit_MomentTol<=0.0_KREAL.or. &
++                .not.ieee_is_finite(Implicit_MinAlpha).or.Implicit_MinAlpha<=0.0_KREAL.or. &
++                Implicit_MinAlpha>1.0_KREAL.or.Implicit_MaxIter<1) &
++                call AbortInvalidImplicitOption('invalid high-order implicit tolerance, CFL or iteration limit')
++        endif
++        if(UnifiedPhysicalOperators)then
++            if(TimeStep_method/=Time_global_varying) &
++                call AbortInvalidImplicitOption('shared physical operators require global physical CFL')
++            if(.not.ieee_is_finite(CouetteMuRef).or.CouetteMuRef<=0) &
++                call AbortInvalidImplicitOption('shared operators require positive viscosity')
++            if(IsHighOrderImplicit().and.(Implicit_MacroSweeps/=2.or.Implicit_MicroSweeps/=1.or.Implicit_MaxRetries/=0)) &
++                call AbortInvalidImplicitOption('HighOrderImplicit requires PR2, one micro pair, no retry')
++        endif
++        if(ClosedCouetteMassRescale)then
++            if(.not.IsImplicitSteady().or.any(BC_Type/=[10,10,2,2]).or.BG_geometry/=0.or. &
++                .not.CouetteUseW2BWall.or.FluxWall_type/=1.or.ACC/=1.or.Iflag_DIS/=0.or. &
++                Iflag_Fringe/=0.or.DISBC_Type/=0.or.Implicit_ClosedMassConstraint) &
++                call AbortInvalidImplicitOption('mass rescale only for closed periodic Couette implicit')
++        endif
+         if(S2VelocityScale/=-1.0_KREAL)then
+             if(.not.ieee_is_finite(S2VelocityScale).or.S2VelocityScale<=0.0_KREAL) &
+                 call AbortInvalidImplicitOption('S2VelocityScale must be positive and finite')
+@@ -368,13 +398,13 @@
+         endif
+         if(slab_enabled)then
+             if(NP_X/=1.or.all(NP_Y/=[1,2,4]).or.Nx_all/=8.or.all(Ny_all/=[32,64]).or. &
+-                trim(TimeIntegration_method)/='S2CN2'.or.FluxWall_type/=1.or.S2W1_wall_mode/=1.or. &
++                (trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or.FluxWall_type/=1.or.S2W1_wall_mode/=1.or. &
+                 VelocityMode()/='half32'.or.S2PhysicalGas/=1.or.ck/=1.or. &
+                 abs(Pr-2.0_KREAL/3.0_KREAL)>epsilon(Pr).or.trim(PeriodicComparisonProfile)/='Off')call AbortInvalidImplicitOption('MPI1 scope violation')
+         endif
+         if(S2PhysicalGas/=0.and.S2PhysicalGas/=1)call AbortInvalidImplicitOption('S2PhysicalGas must be 0 or 1')
+-        if(S2PhysicalGas==1)then
+-            if(trim(TimeIntegration_method)/='S2CN2'.or.(S2W1_wall_mode==1.and.FluxWall_type/=1).or. &
++        if(S2PhysicalGas==1.and.(trim(TimeIntegration_method)=='S2CN2'.or.IsHighOrderImplicit()))then
++            if((trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or.(S2W1_wall_mode==1.and.FluxWall_type/=1).or. &
+                 S2W2R_shared_predictor/=0.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0.or. &
+                 all(ck/=[1,3]))call AbortInvalidImplicitOption('physical gas requires W2 type1 single-rank CK1/3')
+             if(.not.ieee_is_finite(Pr).or.Pr<=0.0_KREAL.or.Pr>1.0_KREAL.or. &
+@@ -382,10 +412,10 @@
+                 .not.ieee_is_finite(omega).or..not.ieee_is_finite(Tcm).or.Tcm<0.0_KREAL.or. &
+                 all(flag_vislaw/=[PowerLaw,Sutherland]))call AbortInvalidImplicitOption('invalid physical transport parameters')
+         endif
+-        if(VelocityMode()/='full16')then
++        if(VelocityMode()/='full16'.and.(trim(TimeIntegration_method)=='S2CN2'.or.IsHighOrderImplicit().or..not.UnifiedPhysicalOperators))then
+             if(Nu/=VelocityCount().or.Nv/=VelocityCount().or.(S2PhysicalGas==0.and.(ck/=1.or.Pr/=1.0_KREAL)).or. &
+                 Quadrature_method/=Quad_GaussHermite.or.FluxWall_type/=1.or.(S2W1_wall_mode==1.and.any(BC_Type/=[10,10,2,2])).or. &
+-                Iflag_DIS/=0.or.Iflag_Fringe/=0.or.trim(TimeIntegration_method)/='S2CN2'.or. &
++                Iflag_DIS/=0.or.Iflag_Fringe/=0.or.(trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or. &
+                 S2W2R_shared_predictor/=0.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0) &
+                 call AbortInvalidImplicitOption('new velocity tables require approved single-rank flat BGK range')
+         endif
+@@ -403,7 +433,7 @@
+             if(Quadrature_method/=Quad_GaussHermite.or.Nu/=16.or.Nv/=16.or.ck/=1.or. &
+                abs(Pr-1.0_KREAL)>epsilon(Pr)) &
+                 call AbortInvalidImplicitOption('BGK_ConstTau requires BGK CK1 frozen GH16xGH16')
+-            if(TimeStep_method/=Time_global_fixed.or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
++            if((TimeStep_method/=Time_global_fixed.and..not.UnifiedPhysicalOperators).or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
+                 call AbortInvalidImplicitOption('BGK_ConstTau requires positive fixed dt')
+             if(any(BC_Type/=BCconst_periodic).or.Iflag_DIS/=0.or.Iflag_Fringe/=0) &
+                 call AbortInvalidImplicitOption('BGK_ConstTau requires double periodic and DIS/fringe off')
+@@ -413,11 +443,11 @@
+         endif
+ 
+         select case (trim(adjustl(TimeIntegration_method)))
+-        case ('Explicit', 'ImplicitSteady', 'ImplicitUnsteady', 'S2D1', 'S2D1VL', 'S2CN2', 'S2Steady')
++        case ('Explicit', 'ImplicitSteady', 'ImplicitUnsteady', 'S2D1', 'S2D1VL', 'S2CN2', 'S2Steady','HighOrderImplicit')
+         case default
+             call AbortInvalidImplicitOption('TimeIntegration_method is unsupported')
+         end select
+-        if(S2W1_wall_mode/=0.and.trim(adjustl(TimeIntegration_method))/='S2CN2') &
++        if(S2W1_wall_mode/=0.and.(trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).and..not.UnifiedPhysicalOperators) &
+             call AbortInvalidImplicitOption('S2W1 wall mode requires S2CN2')
+         if(S2W1_time_centered<0.or.S2W1_time_centered>1) &
+             call AbortInvalidImplicitOption('S2W1_time_centered must be 0 or 1')
+@@ -431,7 +461,7 @@
+         if(S2W2R_shared_predictor<0.or.S2W2R_shared_predictor>1) &
+             call AbortInvalidImplicitOption('S2W2R_shared_predictor must be 0 or 1')
+         if(S2W2R_shared_predictor==1)then
+-            if(trim(adjustl(TimeIntegration_method))/='S2CN2'.or.S2W1_wall_mode/=1.or.FluxWall_type/=1.or. &
++            if((trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).or.S2W1_wall_mode/=1.or.FluxWall_type/=1.or. &
+                 ck/=1.or.Pr/=1.0_KREAL.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0.or. &
+                 NP_X/=1.or.NP_Y/=1)call AbortInvalidImplicitOption('W2R supports only frozen flat type1 BGK setup')
+         endif
+@@ -456,14 +486,14 @@
+                 call AbortInvalidImplicitOption('FluxWall_Maxwell is unsupported for the selected time integration method')
+         endif
+ 
+-        if(trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsS2Steady()) then
++        if((trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsHighOrderImplicit()).or.IsS2Steady()) then
+             if(NP_X<1.or.NP_Y<1)call AbortInvalidImplicitOption('S2CN2 requires positive NP_X/NP_Y')
+             if(IsS2Steady())then
+             rect_flag='';call get_environment_variable('S2_RECT_WALL',rect_flag,status=rect_status)
+             rect_enabled=S2CartesianMesh.or.(rect_status==0.and.trim(rect_flag)=='1')
+             if(Nx_all/=Ny_all)then
+                 if(.not.rect_enabled.or.all(Nx_all/=[8,16]).or.all(Ny_all/=[16,32,64]).or. &
+-                    trim(adjustl(TimeIntegration_method))/='S2CN2'.or.S2W1_wall_mode/=1.or. &
++                    (trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).or.S2W1_wall_mode/=1.or. &
+                     FluxWall_type/=1.or.S2W2R_shared_predictor/=0.or.S2W1_time_centered/=0.or. &
+                     S2W1D_face_time_consistent/=0.or.(S2PhysicalGas==0.and.abs(Pr-1.0_KREAL)>epsilon(Pr))) &
+                     call AbortInvalidImplicitOption('rectangle requires enabled W2 type1 Nx8/16 Ny16/32/64 BGK')
+@@ -476,11 +506,11 @@
+             if(ck/=1.and.S2PhysicalGas==0) call AbortInvalidImplicitOption('S2CN2 legacy requires CK=1')
+             if(S2PhysicalGas==0.and.abs(Pr-1.0_KREAL)>epsilon(Pr).and.abs(Pr-2.0_KREAL/3.0_KREAL)>epsilon(Pr)) &
+                 call AbortInvalidImplicitOption('S2CN2 supports only Pr=1 or Pr=2/3 in this package')
+-            if(TimeStep_method/=Time_global_fixed.or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
++            if((TimeStep_method/=Time_global_fixed.and..not.UnifiedPhysicalOperators).or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
+                 call AbortInvalidImplicitOption('S2CN2 requires positive fixed dt_global')
+             if(S2W1_wall_mode==0)then
+                 if(any(BC_Type/=BCconst_periodic)) call AbortInvalidImplicitOption('S2CN2 requires four periodic boundaries')
+-            elseif(S2W1_wall_mode==1.and.trim(adjustl(TimeIntegration_method))=='S2CN2')then
++            elseif(S2W1_wall_mode==1.and.(trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsHighOrderImplicit()))then
+                 if(any(BC_Type(1:2)/=BCconst_periodic).or.any(BC_Type(3:4)/=BCconst_wall_isothermal)) &
+                     call AbortInvalidImplicitOption('S2W1 requires x periodic and two y isothermal walls')
+                 if((FluxWall_type/=FluxWall_Kinetic.and.FluxWall_type/=FluxWall_Multiscale).or. &
+@@ -561,7 +591,7 @@
+ 
+         do boundary_index = 1, size(BC_Type)
+             select case (BC_Type(boundary_index))
+-            case (BCconst_wall_isothermal, BCconst_symmetry, BCconst_freestream, BCconst_extrapolation)
++            case (BCconst_wall_isothermal, BCconst_symmetry, BCconst_freestream, BCconst_extrapolation,BCconst_periodic)
+             case default
+                 call AbortInvalidImplicitOption('boundary types must be 2, 3, 4, or 6')
+             end select
+@@ -599,6 +629,15 @@
+         call MPI_Bcast(PeriodicComparisonProfile, len(PeriodicComparisonProfile), MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
+         Ipara = int(Ipara_real, KINT)
+ 
++        call MPI_Bcast(CouetteMuRef,1,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(CouetteUseW2BWall,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(Implicit_ClosedMassConstraint,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(Implicit_ZhuMovingWall,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(Implicit_InitHaloResync,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(ClosedCouetteMassRescale,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(WallUx,4,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(StructuredVelocityFile,len(StructuredVelocityFile),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(UnifiedPhysicalOperators,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+         call UnpackIntegerParameters(Ipara)
+         call UnpackRealParameters(Rpara)
+         call MPI_Bcast(S2VelocityTable,len(S2VelocityTable),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
+@@ -875,6 +914,9 @@
+         endif
+ 
+ 
++        if(CouetteMuRef>0)then
++            mu_ref=CouetteMuRef;Kn=sqrt(PI)*mu_ref
++        endif
+         Vinf = Ma * sqrt(gamma / 2.d0)
+         uf = Vinf * cosd(AOA)
+         vf = Vinf * sind(AOA)
+@@ -885,7 +927,7 @@
+         if(S2W2R_shared_predictor<0.or.S2W2R_shared_predictor>1) &
+             call AbortInvalidImplicitOption('S2W2R_shared_predictor must be 0 or 1')
+         if(S2W2R_shared_predictor==1)then
+-            if(trim(adjustl(TimeIntegration_method))/='S2CN2'.or.S2W1_wall_mode/=1.or.FluxWall_type/=1.or. &
++            if((trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).or.S2W1_wall_mode/=1.or.FluxWall_type/=1.or. &
+                 ck/=1.or.Pr/=1.0_KREAL.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0.or. &
+                 NP_X/=1.or.NP_Y/=1)call AbortInvalidImplicitOption('W2R supports only frozen flat type1 BGK setup')
+         endif
+@@ -894,7 +936,9 @@
+             Nu = (Nu / 4) * 4 + 1
+             Nv = (Nv / 4) * 4 + 1
+         case (Quad_GaussHermite)
+-            if(VelocityMode()/='full16')then
++            if(len_trim(StructuredVelocityFile)>0)then
++                continue
++            elseif(VelocityMode()/='full16')then
+                 if(Nu/=VelocityCount().or.Nv/=VelocityCount())call AbortInvalidImplicitOption('selected table count mismatch')
+                 U_MIN=-VelocityMax();U_MAX=-U_MIN;V_MIN=U_MIN;V_MAX=U_MAX
+             elseif (Nu >= 28) then
+--- a/src/mod_InitializeFlow.f90
++++ b/src/mod_InitializeFlow.f90
+@@ -11,6 +11,8 @@
+     use tools
+     use Boundary
+     use mod_ImplicitBoundary, only: BuildStructuredMirrorMaps, ValidateImplicitMaxwellFaces
++    use mod_ClosedCouetteMass, only: ReadMassRestart,InitializeClosedMass
++    use mod_ImplicitMicro, only: EnforceAcceptedMomentCompatibility
+     use mod_SteadyImplicit, only: InitializeSteadyImplicit
+     use mod_UnsteadyImplicit, only: AllocateUnsteadyImplicitState, FillFringeAtStep
+     use mpi
+@@ -27,6 +29,7 @@
+         call InitVelocity()                     !Initialize uSpace, vSpace and weights
+         if(IsImplicitSteady() .or. IsImplicitUnsteady()) call ValidateImplicitMaxwellFaces()
+         call InitFlowField()                    !Set the initial value
++        if(ClosedCouetteMassRescale.and.Iflag_InitFlow==Init_Restart)call ReadMassRestart()
+         call Init_fringe_x()                    !Initialize fringe function
+         if(bc_type(1)==BCconst_inflow .or. &
+            (Iflag_DIS==1 .and. DISBC_type==DISBC_inflow_TS)) then !Initialize inflow/TS boundary data
+@@ -38,7 +41,12 @@
+         call MPIUpdate_CellVDF()
+         call MPIUpdate_Conner_conVars()
+         call MPIUpdate_Conner_VDF()
+-        if(IsImplicitSteady() .or. IsImplicitUnsteady()) call InitializeSteadyImplicit()
++        if(IsImplicitSteady() .or. IsImplicitUnsteady().or.UnifiedPhysicalOperators) call InitializeSteadyImplicit()
++        if((IsImplicitSteady().or.UnifiedPhysicalOperators).and.Implicit_InitHaloResync)then
++            call MPIUpdate_CellConVars();call MPIUpdate_CellVDF()
++            call MPIUpdate_Conner_conVars();call MPIUpdate_Conner_VDF()
++        endif
++        if(ClosedCouetteMassRescale)call InitializeClosedMass()
+         if(IsS2Steady()) call InitializeS2Steady()
+         if(IsImplicitUnsteady()) call AllocateUnsteadyImplicitState()
+         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+@@ -106,6 +114,16 @@
+         allocate(cell_b0_store(Nvel,1-LAP:nx+LAP,1-LAP:ny+LAP))
+         allocate(cell_res_h0_store(Nvel,1-LAP:nx+LAP,1-LAP:ny+LAP))
+         allocate(cell_res_b0_store(Nvel,1-LAP:nx+LAP,1-LAP:ny+LAP))
++        ! Wall-exterior slots are not physical states, but complete R6 restart
++        ! snapshots include their storage. Initialize it deterministically.
++        if(UnifiedPhysicalOperators)then
++            cell_h_store=0;cell_b_store=0;cell_h0_store=0;cell_b0_store=0
++            cell_res_h0_store=0;cell_res_b0_store=0
++            do j=1-LAP,ny+LAP;do i=1-LAP,nx+LAP
++                ctr(i,j)%conVars=0;ctr(i,j)%conVars0=0;ctr(i,j)%sw=0
++                ctr(i,j)%res_conVars0=0;ctr(i,j)%dt_local=dt_global
++            enddo;enddo
++        endif
+         cell_sh_store = 0.0_KREAL
+         cell_sb_store = 0.0_KREAL
+ 
+@@ -435,7 +453,9 @@
+     subroutine InitVelocity()
+         real(KREAL) :: raw_node(Nu),raw_weight(Nu)
+ 
+-        if (IsS2CN2().or.IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
++        if(len_trim(StructuredVelocityFile)>0)then
++            call InitVelocityFromStructuredFile()
++        elseif (IsS2CN2().or.IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
+             ! S2CN2 uses the exact effective GH16 rule frozen by S2D-1-R1.
+             ! uSpace/vSpace/weight remain the native authoritative velocity arrays.
+             call S2InitVelocity(uSpace,vSpace,weight,raw_node,raw_weight)
+@@ -457,6 +477,38 @@
+     !--------------------------------------------------
+     !>Synchronize primary Nvel velocity arrays from the velocity-space cache.
+     !--------------------------------------------------
++    subroutine InitVelocityFromStructuredFile()
++        integer :: iu,ios,n1,n2,k,i,j,l
++        logical :: valid
++        if (myID==0) then
++            open(newunit=iu,file=trim(StructuredVelocityFile),status='old',action='read',iostat=ios)
++            if (ios/=0) call MPI_Abort(MPI_COMM_WORLD,201,ierr)
++            read(iu,*,iostat=ios) n1,n2
++            if (ios/=0) call MPI_Abort(MPI_COMM_WORLD,202,ierr)
++            if(n1/=Nu.or.n2/=Nv) call MPI_Abort(MPI_COMM_WORLD,203,ierr)
++            do k=1,Nvel
++                read(iu,*,iostat=ios) uSpace(k),vSpace(k),weight(k)
++                if (ios/=0) call MPI_Abort(MPI_COMM_WORLD,204,ierr)
++            enddo
++            close(iu)
++        endif
++        call MPI_Bcast(uSpace,Nvel,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(vSpace,Nvel,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
++        call MPI_Bcast(weight,Nvel,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
++        valid=all(ieee_is_finite(uSpace)).and.all(ieee_is_finite(vSpace)) &
++            .and.all(ieee_is_finite(weight)).and.all(weight>0.0_KREAL)
++        do j=1,Nv; do i=1,Nu
++            k=i+(j-1)*Nu
++            valid=valid.and.uSpace(k)==uSpace(i).and.vSpace(k)==vSpace(1+(j-1)*Nu)
++            l=(Nu+1-i)+(Nv-j)*Nu
++            valid=valid.and.uSpace(k)==-uSpace(l).and.vSpace(k)==-vSpace(l).and.weight(k)==weight(l)
++        enddo; enddo
++        if (.not.valid) call MPI_Abort(MPI_COMM_WORLD,205,ierr)
++        U_MIN=minval(uSpace); U_MAX=maxval(uSpace)
++        V_MIN=minval(vSpace); V_MAX=maxval(vSpace)
++    end subroutine InitVelocityFromStructuredFile
++
++
+     subroutine FlattenVelocitySpace()
+         integer(KINT)                                   :: k
+ 
+@@ -712,13 +764,13 @@
+             case(Init_Macroflow)
+                 call InitFlow_Macroflow
+             case(Init_Restart)
+-                call S2NativeReadMetadata(.true.)
++                if(.not.UnifiedPhysicalOperators)call S2NativeReadMetadata(.true.)
+                 call InitFlow_Restart
+             case default
+                 error stop 'unsupported native S2 Iflag_InitFlow'
+             end select
+             call S2NativeInitializeState(.true.,Iflag_InitFlow/=Init_Restart)
+-            if(Iflag_InitFlow==Init_Restart)call S2NativeReadMetadata(.false.)
++            if(Iflag_InitFlow==Init_Restart.and..not.UnifiedPhysicalOperators)call S2NativeReadMetadata(.false.)
+         elseif(IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
+             call S2NativeInitializeState()
+         elseif(Iflag_DIS==0) then
+--- a/src/mod_Interpolation.f90
++++ b/src/mod_Interpolation.f90
+@@ -37,6 +37,12 @@
+         !i direction
+         do j=1-GHOST+1,ny+GHOST-1
+             do i=1-GHOST+1,nx+GHOST-1
++                if(UnifiedPhysicalOperators)then
++                    if(IP_Y==0.and.BC_Type(3)==2.and.j<1)cycle
++                    if(IP_Y==NP_Y-1.and.BC_Type(4)==2.and.j>ny)cycle
++                    if(IP_X==0.and.BC_Type(1)==2.and.i<=1)cycle
++                    if(IP_X==NP_X-1.and.BC_Type(2)==2.and.i>=nx)cycle
++                endif
+                 call InterpInner(ctr(i-1,j),ctr(i,j),ctr(i+1,j),IDIRC)
+             end do
+         end do
+@@ -44,6 +50,12 @@
+         !j direction
+         do j=1-GHOST+1,ny+GHOST-1
+             do i=1-GHOST+1,nx+GHOST-1
++                if(UnifiedPhysicalOperators)then
++                    if(IP_X==0.and.BC_Type(1)==2.and.i<1)cycle
++                    if(IP_X==NP_X-1.and.BC_Type(2)==2.and.i>nx)cycle
++                    if(IP_Y==0.and.BC_Type(3)==2.and.j<=1)cycle
++                    if(IP_Y==NP_Y-1.and.BC_Type(4)==2.and.j>=ny)cycle
++                endif
+                 call InterpInner(ctr(i,j-1),ctr(i,j),ctr(i,j+1),JDIRC)
+             end do
+         end do
+--- /dev/null
++++ b/src/mod_NativeWiringChecks.f90
+@@ -0,0 +1,73 @@
++! Optional bounded wiring observations. No numerical changes or extra sweeps.
++module mod_NativeWiringChecks
++    use flow_data
++    use mod_ImplicitState
++    use mod_ImplicitCommon,only:MomentConserved
++    use mpi
++    use,intrinsic::ieee_arithmetic
++    implicit none
++    logical,save::enabled=.false.,initialized=.false.,dumped=.false.
++contains
++    logical function WiringChecksEnabled()
++        character(len=8)::value
++        integer::status
++        if(.not.initialized)then
++            call get_environment_variable('NATIVE_WIRING_CHECKS',value,status=status)
++            enabled=status==0.and.trim(value)=='1';initialized=.true.
++        endif
++        WiringChecksEnabled=enabled
++    end function
++    subroutine DumpPhysicalOperators()
++        integer::fu,i,j
++        character(len=64)::name
++        if(.not.WiringChecksEnabled().or.dumped.or..not.UnifiedPhysicalOperators)return
++        write(name,'(A,I0,A)')'physical_operator_rank',myID,'.bin'
++        open(newunit=fu,file=trim(name),status='replace',access='stream',form='unformatted')
++        write(fu)nx,ny,Nvel,Block_XY(myID)%Origin_I,Block_XY(myID)%Origin_J
++        write(fu)ctr(1,1)%dt_local,uVel,vVel,wVel
++        do j=1,ny;do i=1,nx
++            write(fu)ctr(i,j)%area,ctr(i,j)%conVars,ctr(i,j)%h_vec,ctr(i,j)%b_vec
++        enddo;enddo
++        write(fu)rate_w,stream_h,stream_b,physical_equilibrium_h,physical_equilibrium_b, &
++            physical_collision_h,physical_collision_b
++        do j=1,ny;do i=1,nx+1
++            write(fu)vface(i,j)%L_flux,vface(i,j)%R_flux,vface(i,j)%L_flux_h_vec, &
++                vface(i,j)%R_flux_h_vec,vface(i,j)%L_flux_b_vec,vface(i,j)%R_flux_b_vec
++        enddo;enddo
++        do j=1,ny+1;do i=1,nx
++            write(fu)hface(i,j)%L_flux,hface(i,j)%R_flux,hface(i,j)%L_flux_h_vec, &
++                hface(i,j)%R_flux_h_vec,hface(i,j)%L_flux_b_vec,hface(i,j)%R_flux_b_vec
++        enddo;enddo
++        close(fu);dumped=.true.
++    end subroutine
++    subroutine RecordWiringState()
++        real(KREAL)::local(4),global(4),moment(4),gap,global_gap,err,errg
++        integer::i,j,fu,counts(3),lo(3),hi(3)
++        logical::ok,allok
++        if(.not.WiringChecksEnabled())return
++        local=0;gap=0;ok=.true.;err=0
++        do j=1,ny;do i=1,nx
++            call MomentConserved(ctr(i,j)%h_vec,ctr(i,j)%b_vec,uVel,vVel,wVel,moment)
++            local=local+ctr(i,j)%area*ctr(i,j)%conVars
++            gap=max(gap,maxval(abs(moment-ctr(i,j)%conVars)/max(1.0_KREAL,abs(ctr(i,j)%conVars))))
++            ok=ok.and.all(ieee_is_finite(ctr(i,j)%conVars)).and.all(ieee_is_finite(ctr(i,j)%h_vec)).and.all(ieee_is_finite(ctr(i,j)%b_vec))
++        enddo;enddo
++        if(allocated(delta_h))err=max(maxval(abs(delta_w)),maxval(abs(delta_h)),maxval(abs(delta_b)))
++        call MPI_Allreduce(local,global,4,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(gap,global_gap,1,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(err,errg,1,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(ok,allok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        counts=[macro_pr_passes,r4_forward_scans,r4_backward_scans]
++        call MPI_Allreduce(counts,lo,3,MPI_INTEGER,MPI_MIN,MPI_COMM_WORLD,ierr)
++        call MPI_Allreduce(counts,hi,3,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierr)
++        if(myID/=0)return
++        if(iter==0)then
++            open(newunit=fu,file='wiring_states.csv',status='replace')
++            write(fu,'(A)')'iter,mass,Px,Py,E,moment_gap,max_correction,finite,PR_passes_min,forward_min,backward_min,PR_passes_max,forward_max,backward_max'
++        else
++            open(newunit=fu,file='wiring_states.csv',status='old',position='append')
++        endif
++        write(fu,'(I0,6(",",ES24.16),",",L1,6(",",I0))')iter,global,global_gap,errg,allok,lo,hi
++        close(fu)
++    end subroutine
++end module
+--- a/src/mod_Output.f90
++++ b/src/mod_Output.f90
+@@ -3,10 +3,11 @@
+     use mod_S2MPI1Layout,only:communication_seconds,communication_clock
+     use flow_data
+     use Flow_DIS
++    use mod_ClosedCouetteMass,only:WriteMassRestart
+     use Tools
+     use mpi
+     use mod_S2D1, only: IsS2CN2,IsS2Steady
+-    use mod_S2NativeAdapter, only: S2NativeWriteOutput,S2NativeOutputHeat,S2NativeCommitRestart,S2NativeRunSummary
++    use mod_S2NativeAdapter, only: S2NativeWriteOutput,S2NativeOutputHeat,S2NativeCommitRestart,S2NativeRunSummary,S2NativePublishWallDiagnostics
+     implicit none
+     
+ contains
+@@ -18,9 +19,12 @@
+             call S2NativeWriteOutput()
+             return
+         endif
++        if(IsS2CN2().and.UnifiedPhysicalOperators.and.S2W1_wall_mode==1)call S2NativePublishWallDiagnostics()
+         if(Iflag_WriteSurf==1)      call write_wallboundary
+         call write_flow
+-        if(IsS2CN2())then
++        if(IsHighOrderImplicit())then
++            if(Iflag_WriteRestart==1)call write_restart()
++        elseif(IsS2CN2())then
+             if(Iflag_WriteSurf==1.and.S2W1_wall_mode==1)call write_wallboundary(2)
+             if(Iflag_WriteRestart==1)then
+                 call write_restart('flow2d.dat.next','vdf2d.dat.next','grid2d.grd.next')
+@@ -31,6 +35,7 @@
+         elseif(Iflag_WriteRestart==1)then
+             call write_restart()
+         endif
++        if(ClosedCouetteMassRescale.and.Iflag_WriteRestart==1)call WriteMassRestart()
+     end subroutine Output_result
+     
+     
+@@ -65,7 +70,7 @@
+                     solution(i,j,5)     = 0.5*solution(i,j,1)*solution(i,j,4)                       !Pressure=0.5*rho*T
+                     !Evaluate macro output moments directly from flattened cell-center VDF views.
+                     solution(i,j,6:8)   = Get_Stress_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)      !Shear stress
+-                    if(IsS2CN2())then
++                    if(IsS2CN2().and..not.IsHighOrderImplicit())then
+                         solution(i,j,9:10)=S2NativeOutputHeat(i,j)
+                     else
+                         solution(i,j,9:10)=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)
+@@ -158,7 +163,7 @@
+             !call write_wallboundary
+             ! Legacy external-flow binary output needs surf.dat and nonzero Mach scaling.
+             ! Native S2 uses the same Tecplot writer below, including stationary walls.
+-            if(.not.IsS2CN2())then
++            if(.not.IsS2CN2().and..not.UnifiedPhysicalOperators)then
+             allocate(surfx(nx_all),surfy(nx_all),FlowVars_all(nx_all,5))
+             open(1,file='surf.dat',form='unformatted')
+             read(1) 
+--- /dev/null
++++ b/src/mod_R5Observe.f90
+@@ -0,0 +1,489 @@
++module mod_R5Observe
++    use mod_ClosedCouetteMass
++    use mod_ImplicitDiagnostics, only: UpdateImplicitResidualDiagnostics, ImplicitConverged, GetImplicitReferences, AbortSteadyImplicit, InheritImplicitReferences
++    use Boundary
++    use mod_S2D1,only:IsS2CN2
++    use mod_Interpolation
++    use mod_Evolution
++    use mod_Residual
++    use mpi_wrapper
++    implicit none
++    real(KREAL) :: native_science(22),last_view_science(22)
++    real(KREAL) :: profile_seconds=0.0_KREAL,diag_seconds=0.0_KREAL,checkpoint_seconds=0.0_KREAL,csv_seconds=0.0_KREAL
++    real(KREAL) :: cost_prev(9)=0.0_KREAL,control_begin=0.0_KREAL,control_limit=230.0_KREAL
++    integer :: old_forward=0,old_backward=0,origin_iteration=100,verified_streak=0
++    integer :: evaluation_state=-1,last_checkpoint=-1,profile_state=100
++    logical :: verify_active=.false.,references_written=.false.,last_view_pass=.false.
++    character(len=64) :: r5_stop_reason='running'
++    logical :: r6_preflight=.false.
++    integer :: reference_epoch_state=0
++contains
++    function SciencePack() result(v)
++        real(KREAL) :: v(22)
++        v=[implicit_macro_residual,implicit_macro_relative,implicit_macro_absolute, &
++            implicit_h_norm,implicit_b_norm,implicit_h_relative,implicit_b_relative,implicit_h_absolute,implicit_b_absolute, &
++            implicit_moment_error,implicit_mass_defect,r5_raw_h,r5_raw_b]
++    end function
++    subroutine RestoreScience(v)
++        real(KREAL),intent(in) :: v(22)
++        implicit_macro_residual=v(1:4);implicit_macro_relative=v(5:8);implicit_macro_absolute=v(9:12)
++        implicit_h_norm=v(13);implicit_b_norm=v(14);implicit_h_relative=v(15);implicit_b_relative=v(16)
++        implicit_h_absolute=v(17);implicit_b_absolute=v(18);implicit_moment_error=v(19);implicit_mass_defect=v(20)
++        r5_raw_h=v(21);r5_raw_b=v(22)
++    end subroutine
++    subroutine PhysicalDiagnostic(residual,flux,rebuild)
++        real(KREAL),intent(out) :: residual(8),flux(16)
++        logical,intent(in) :: rebuild
++        real(KREAL) :: start,profile_start,fl(4,4),fg(4,4),saved_science(22)
++        real(KREAL) :: refh(Nvel),refb(Nvel),dh(Nvel),db(Nvel)
++        integer :: i,j
++        logical :: ok
++        type(CellCenter),allocatable :: view_ctr(:,:)
++        type(CellInterface),allocatable :: view_vface(:,:),view_hface(:,:)
++        real(KREAL),allocatable :: view_cell_h_store(:,:,:)
++        real(KREAL),allocatable :: view_cell_b_store(:,:,:)
++        real(KREAL),allocatable :: view_cell_sh_store(:,:,:,:)
++        real(KREAL),allocatable :: view_cell_sb_store(:,:,:,:)
++        real(KREAL),allocatable :: view_v_l_flux_h_store(:,:,:)
++        real(KREAL),allocatable :: view_v_l_flux_b_store(:,:,:)
++        real(KREAL),allocatable :: view_v_r_flux_h_store(:,:,:)
++        real(KREAL),allocatable :: view_v_r_flux_b_store(:,:,:)
++        real(KREAL),allocatable :: view_h_l_flux_h_store(:,:,:)
++        real(KREAL),allocatable :: view_h_l_flux_b_store(:,:,:)
++        real(KREAL),allocatable :: view_h_r_flux_h_store(:,:,:)
++        real(KREAL),allocatable :: view_h_r_flux_b_store(:,:,:)
++        real(KREAL),allocatable :: view_res_macro_flux_store(:,:,:)
++        real(KREAL),allocatable :: view_res_macro_store(:,:,:)
++        real(KREAL),allocatable :: view_res_h_flux_store(:,:,:)
++        real(KREAL),allocatable :: view_res_b_flux_store(:,:,:)
++        real(KREAL),allocatable :: view_rate_w(:,:,:)
++        real(KREAL),allocatable :: view_stream_h(:,:,:)
++        real(KREAL),allocatable :: view_stream_b(:,:,:)
++        start=MPI_Wtime()
++        saved_science=SciencePack();profile_start=profile_seconds
++        if (rebuild) then
++            view_ctr=ctr;view_vface=vface;view_hface=hface
++            view_cell_h_store=cell_h_store
++            view_cell_b_store=cell_b_store
++            view_cell_sh_store=cell_sh_store
++            view_cell_sb_store=cell_sb_store
++            view_v_l_flux_h_store=v_l_flux_h_store
++            view_v_l_flux_b_store=v_l_flux_b_store
++            view_v_r_flux_h_store=v_r_flux_h_store
++            view_v_r_flux_b_store=v_r_flux_b_store
++            view_h_l_flux_h_store=h_l_flux_h_store
++            view_h_l_flux_b_store=h_l_flux_b_store
++            view_h_r_flux_h_store=h_r_flux_h_store
++            view_h_r_flux_b_store=h_r_flux_b_store
++            view_res_macro_flux_store=res_macro_flux_store
++            view_res_macro_store=res_macro_store
++            view_res_h_flux_store=res_h_flux_store
++            view_res_b_flux_store=res_b_flux_store
++            view_rate_w=rate_w
++            view_stream_h=stream_h
++            view_stream_b=stream_b
++            call MPIUpdate_CellConVars()
++            call MPIUpdate_CellVDF()
++            call MPIUpdate_Conner_conVars()
++            call MPIUpdate_Conner_VDF()
++            call Set_Ghost_PhysBoundary()
++            if(.not.IsS2CN2())call Interpolation()
++            call Evolution()
++            call ComputeResidual()
++            call AssembleSteadyRateResiduals()
++        endif
++        if (rebuild) call UpdateImplicitResidualDiagnostics()
++        residual=[implicit_macro_absolute,r5_raw_h,r5_raw_b,implicit_h_absolute,implicit_b_absolute]
++        last_view_science=SciencePack()
++        fl=0.0_KREAL
++        do j=1,ny;do i=1,nx
++            if (i==1 .and. IP_X==0) fl(:,1)=fl(:,1)-vface(i,j)%L_flux/ctr(i,j)%dt_local
++            if (i==nx .and. IP_X==NP_X-1) fl(:,2)=fl(:,2)+vface(i+1,j)%R_flux/ctr(i,j)%dt_local
++            if (j==1 .and. IP_Y==0) fl(:,3)=fl(:,3)-hface(i,j)%L_flux/ctr(i,j)%dt_local
++            if (j==ny .and. IP_Y==NP_Y-1) fl(:,4)=fl(:,4)+hface(i,j+1)%R_flux/ctr(i,j)%dt_local
++        enddo;enddo
++        call MPI_Allreduce(fl,fg,16,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
++        flux=reshape(fg,[16])
++        if (.not.all(ieee_is_finite(residual)) .or. .not.all(ieee_is_finite(flux))) &
++            call MassAbort('nonfinite original physical diagnostic')
++        call WriteProfilesAndWalls()
++        if (rebuild) then
++            call RestoreScience(saved_science)
++            ctr=view_ctr;vface=view_vface;hface=view_hface
++            cell_h_store=view_cell_h_store
++            cell_b_store=view_cell_b_store
++            cell_sh_store=view_cell_sh_store
++            cell_sb_store=view_cell_sb_store
++            v_l_flux_h_store=view_v_l_flux_h_store
++            v_l_flux_b_store=view_v_l_flux_b_store
++            v_r_flux_h_store=view_v_r_flux_h_store
++            v_r_flux_b_store=view_v_r_flux_b_store
++            h_l_flux_h_store=view_h_l_flux_h_store
++            h_l_flux_b_store=view_h_l_flux_b_store
++            h_r_flux_h_store=view_h_r_flux_h_store
++            h_r_flux_b_store=view_h_r_flux_b_store
++            res_macro_flux_store=view_res_macro_flux_store
++            res_macro_store=view_res_macro_store
++            res_h_flux_store=view_res_h_flux_store
++            res_b_flux_store=view_res_b_flux_store
++            rate_w=view_rate_w
++            stream_h=view_stream_h
++            stream_b=view_stream_b
++        endif
++        if (rebuild) diag_seconds=diag_seconds+MPI_Wtime()-start-(profile_seconds-profile_start)
++    end subroutine
++
++    subroutine R5FiniteFluxGuard()
++        logical :: local,global
++        integer :: i,j
++        if (.not.ClosedCouetteMassRescale) return
++        local=.true.
++        do j=1,ny;do i=1,nx+1
++            local=local .and. all(ieee_is_finite(vface(i,j)%L_flux)) .and. all(ieee_is_finite(vface(i,j)%R_flux))
++        enddo;enddo
++        do j=1,ny+1;do i=1,nx
++            local=local .and. all(ieee_is_finite(hface(i,j)%L_flux)) .and. all(ieee_is_finite(hface(i,j)%R_flux))
++        enddo;enddo
++        call MPI_Allreduce(local,global,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        if (.not.global) then
++            r5_stop_reason='nonfinite_original_flux'
++            call WriteR5Checkpoint(.true.)
++            call SaveRejectedProposal()
++            call AbortSteadyImplicit('R5 nonfinite flux; last accepted physical state and proposal caches saved')
++        endif
++    end subroutine
++
++    subroutine StartR5Control()
++        character(len=80) :: value
++        integer :: status,unit,ios,k
++        real(KREAL) :: h,b,rtol,mtol
++        logical :: exists
++        origin_iteration=restart_step
++        reference_epoch_state=origin_iteration
++        if (.not.ClosedCouetteMassRescale) then
++            r5_force_true_updates=.false.
++            return
++        endif
++        if (origin_iteration<0) call MassAbort('invalid checkpoint origin iteration')
++        r5_force_true_updates=ClosedCouetteMassRescale .and. IsImplicitSteady()
++        inquire(file='residual_reference.in',exist=exists)
++        if (exists) then
++            open(newunit=unit,file='residual_reference.in',status='old',iostat=ios)
++            if (ios/=0) call MassAbort('cannot open residual reference inheritance file')
++            read(unit,*,iostat=ios) reference_epoch_state,h,b,rtol,mtol
++            close(unit)
++            if (ios/=0) call MassAbort('cannot read residual reference inheritance file')
++            if (rtol/=Implicit_ResidualTol .or. mtol/=Implicit_MomentTol) &
++                call MassAbort('reference inheritance convergence thresholds mismatch')
++            if (reference_epoch_state>origin_iteration) call MassAbort('reference epoch after checkpoint')
++            call InheritImplicitReferences(h,b)
++        else if (Iflag_InitFlow==2) then
++            call MassAbort('Couette restart requires residual_reference.in; refusing reference reset')
++        endif
++        call get_environment_variable('R6_MODE',value,status=status)
++        if (status==0) r6_preflight=trim(value)=='preflight'
++        call get_environment_variable('R6_INITIAL_STREAK',value,status=status)
++        if (status==0) then
++            read(value,*) verified_streak
++            if (verified_streak<0 .or. verified_streak>3) call MassAbort('invalid inherited streak')
++        endif
++        if (myID==0) then
++            open(newunit=unit,file='velocity_loaded.dat',status='replace')
++            write(unit,'(i0)') Nvel
++            do k=1,Nvel
++                write(unit,'(*(es25.16e3,:,","))') uVel(k),vVel(k),wVel(k)
++            enddo
++            close(unit)
++        endif
++        control_begin=MPI_Wtime()
++        call get_environment_variable('R5_WALL_LIMIT',value,status=status)
++        if (status==0) read(value,*) control_limit
++    end subroutine
++
++    logical function R5ShouldStop()
++        logical :: request,global_request
++        R5ShouldStop=.false.
++        if (.not.r5_force_true_updates) return
++        request=MPI_Wtime()-control_begin>=control_limit
++        if (myID==0) then
++            inquire(file='STOP_REQUEST',exist=global_request)
++            request=request .or. global_request
++        endif
++        call MPI_Allreduce(request,global_request,1,MPI_LOGICAL,MPI_LOR,MPI_COMM_WORLD,ierr)
++        R5ShouldStop=global_request
++        if (global_request) r5_stop_reason='resource_budget_controlled_stop'
++    end function
++
++    subroutine BeginR5Step()
++        old_forward=r4_forward_scans;old_backward=r4_backward_scans
++    end subroutine
++
++    subroutine AfterNativeResidual()
++        real(KREAL) :: h,b,start
++        integer :: unit
++        if (.not.ClosedCouetteMassRescale) return
++        native_science=SciencePack()
++        if (.not.references_written) then
++            call GetImplicitReferences(h,b)
++            if (myID==0) then
++                open(newunit=unit,file='reference_epoch.csv',status='replace')
++                write(unit,'(a)') 'origin_state,reference_h,reference_b,residual_tolerance,moment_tolerance'
++                write(unit,'(i0,",")',advance='no') reference_epoch_state
++                write(unit,'(*(es25.16e3,:,","))') h,b,Implicit_ResidualTol,Implicit_MomentTol
++                close(unit)
++            endif
++            references_written=.true.
++        endif
++        if (ImplicitConverged()) verify_active=.true.
++        ! R6 records each post-update accepted state; the initial state was checked separately.
++    end subroutine
++
++    subroutine CheckR5Policy(ok)
++        logical,intent(inout) :: ok
++        logical :: local,global
++        local=ok .and. implicit_alpha==1.0_KREAL .and. r5_macro_alpha==1.0_KREAL .and. &
++            implicit_ncfl_active==1000.0_KREAL .and. implicit_retry_count==0 .and. &
++            r4_forward_scans-old_forward==1 .and. r4_backward_scans-old_backward==1
++        call MPI_Allreduce(local,global,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        ok=global
++    end subroutine
++
++    subroutine RecordAcceptedLight()
++        integer :: unit,k
++        real(KREAL) :: start
++        start=MPI_Wtime()
++        if (myID==0) then
++            open(newunit=unit,file='light_steps.csv',status='unknown',position='append')
++            if (iter==0) then
++                write(unit,'(a)',advance='no') 'local_update,cumulative_update,native_residual_state,M0,c_minus1,Mstar_W,Mstar_h,Mnew_W,Mnew_h'
++                write(unit,'(a)',advance='no') ',alpha,macro_alpha,nCFL,retries,forward_scans,backward_scans,moment_star,moment_new,min_rho,min_internal_energy,finite,original_gate,scale_gate'
++                write(unit,'(a)',advance='no') ',dM,dPx,dPy,dE,ledger_M,ledger_Px,ledger_Py,ledger_E'
++                do k=1,22
++                    write(unit,'(a,i0)',advance='no') ',native_',k
++                enddo
++                write(unit,*)
++            endif
++            write(unit,'(3(i0,","))',advance='no') iter+1,origin_iteration+iter+1,origin_iteration+iter
++            write(unit,'(*(es25.16e3,:,","))') closed_mass_target,mass_scale-1.0_KREAL, &
++                mass_before(1),mass_before(5),mass_after(1),mass_after(5), &
++                implicit_alpha,r5_macro_alpha,implicit_ncfl_active,real(implicit_retry_count,KREAL), &
++                real(r4_forward_scans-old_forward,KREAL),real(r4_backward_scans-old_backward,KREAL), &
++                mass_before_metrics(1),mass_after_metrics(1),mass_after_metrics(4:5), &
++                1.0_KREAL,1.0_KREAL,1.0_KREAL,scale_increment,correction_ledger,native_science
++            close(unit)
++        endif
++        csv_seconds=csv_seconds+MPI_Wtime()-start
++    end subroutine
++
++    subroutine AfterR5Accepted()
++        if (.not.ClosedCouetteMassRescale) return
++        ! Exactly one distinct state follows each genuine PR(2) + one forward/backward sweep.
++        call EvaluateSparseState('accepted_convergence_verification',.true.)
++        if (last_view_pass) then
++            verified_streak=verified_streak+1
++        else
++            verified_streak=0
++        endif
++        call WriteR5Checkpoint(.true.)
++    end subroutine
++
++    subroutine EvaluateSparseState(reason,rebuild)
++        character(len=*),intent(in) :: reason
++        logical,intent(in) :: rebuild
++        real(KREAL) :: residual(8),flux(16),totals(5),metrics(5),start,h,b
++        integer :: k,unit
++        logical :: ok
++        if (evaluation_state==origin_iteration+iter) return
++        profile_state=origin_iteration+iter
++        start=MPI_Wtime()
++        call MassStatistics(totals,metrics,ok)
++        if (.not.ok) call MassAbort('R5 sparse accepted-state gate failed')
++        call PhysicalDiagnostic(residual,flux,rebuild)
++        last_view_pass=all(last_view_science(1:4)<=Implicit_ResidualTol) .and. &
++            all(last_view_science(13:14)<=Implicit_ResidualTol) .and. metrics(1)<=Implicit_MomentTol
++        call GetImplicitReferences(h,b)
++        if (myID==0) then
++            open(newunit=unit,file='sparse_residual.csv',status='unknown',position='append')
++            if (evaluation_state<0) then
++                write(unit,'(a)',advance='no') 'local_state,cumulative_state,source,original_gate,moment,M_W,M_h'
++                do k=1,8
++                    write(unit,'(a,i0)',advance='no') ',R',k
++                enddo
++                do k=1,22
++                    write(unit,'(a,i0)',advance='no') ',science_',k
++                enddo
++                do k=1,16
++                    write(unit,'(a,i0)',advance='no') ',flux_',k
++                enddo
++                write(unit,'(a)') ',reference_h,reference_b'
++            endif
++            write(unit,'(2(i0,","),a,",")',advance='no') iter,profile_state,trim(reason)
++            write(unit,'(*(es25.16e3,:,","))') merge(1.0_KREAL,0.0_KREAL,last_view_pass),metrics(1),totals(1),totals(5), &
++                residual,last_view_science,flux,h,b
++            close(unit)
++        endif
++        if (myID==0) then
++            open(newunit=unit,file='consecutive_states.csv',status='unknown',position='append')
++            if (evaluation_state<0) write(unit,'(a)') 'cumulative_state,pass,streak_after_evaluation'
++            write(unit,'(i0,",",l1,",",i0)') profile_state,last_view_pass, &
++                merge(merge(verified_streak,verified_streak+1,r6_preflight),0,last_view_pass)
++            close(unit)
++        endif
++        evaluation_state=profile_state
++        ! PhysicalDiagnostic accounts full evaluation including the temporary cache view.
++        csv_seconds=csv_seconds+MPI_Wtime()-start ! Inclusive sparse dispatch (separately documented).
++    end subroutine
++
++    subroutine WriteProfilesAndWalls()
++        real(KREAL) :: prim(4),q(2),stress,fw(4),shear,heat,begin_io
++        real(KREAL) :: local(10,2),global(10,2)
++        integer :: i,j,unit,wall
++        character(len=96) :: name
++        begin_io=MPI_Wtime()
++        write(name,'(a,i6.6,a,i0,a)') 'profile_',profile_state,'_rank',myID,'.csv'
++        open(newunit=unit,file=trim(name),status='replace')
++        write(unit,'(a)') 'x,y,rho,U,V,T_native,qx,qy,tau,Pxy'
++        do j=1,ny;do i=1,nx
++            prim=GetPrimary(ctr(i,j)%conVars)
++            q=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)
++            stress=sum(wVel*(uVel-prim(2))*(vVel-prim(3))*ctr(i,j)%h_vec)
++            write(unit,'(*(es25.16e3,:,","))') ctr(i,j)%x,ctr(i,j)%y,prim(1:3),1.0_KREAL/prim(4),q,GetTau(prim),stress
++        enddo;enddo
++        close(unit)
++        local=0.0_KREAL
++        do i=1,nx
++            if (IP_Y==0) then
++                fw=-hface(i,1)%L_flux/ctr(i,1)%dt_local
++                local(1:4,1)=local(1:4,1)+fw
++                local(5,1)=local(5,1)+hface(i,1)%length
++                local(6,1)=local(6,1)+fw(4)-WallUx(3)*fw(2)
++                local(7:9,1)=local(7:9,1)+hface(i,1)%Aerodynamics*hface(i,1)%length
++            endif
++            if (IP_Y==NP_Y-1) then
++                fw=hface(i,ny+1)%R_flux/ctr(i,ny)%dt_local
++                local(1:4,2)=local(1:4,2)+fw
++                local(5,2)=local(5,2)+hface(i,ny+1)%length
++                local(6,2)=local(6,2)+fw(4)-WallUx(4)*fw(2)
++                local(7:9,2)=local(7:9,2)+hface(i,ny+1)%Aerodynamics*hface(i,ny+1)%length
++            endif
++        enddo
++        call MPI_Allreduce(local,global,20,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
++        if (myID==0) then
++            open(newunit=unit,file='wall_history.csv',status='unknown',position='append')
++            if (evaluation_state<0) write(unit,'(a)') 'cumulative_state,wall,out_mass,out_Px,out_Py,out_E,length,out_heat,shear_per_length,heat_per_length,native_pnn,native_pnt,native_qn'
++            do wall=1,2
++                write(unit,'(2(i0,","))',advance='no') profile_state,wall
++                write(unit,'(*(es25.16e3,:,","))') global(1:6,wall),global(2,wall)/global(5,wall), &
++                    global(6,wall)/global(5,wall),global(7:9,wall)/global(5,wall)
++            enddo
++            close(unit)
++        endif
++        profile_seconds=profile_seconds+MPI_Wtime()-begin_io
++    end subroutine
++
++    subroutine WriteR5Checkpoint(force)
++        logical,intent(in) :: force
++        integer :: unit,i,j,ios,version,cumulative
++        real(KREAL) :: start,mass_ref_h,mass_ref_b
++        character(len=96) :: name
++        if (.not.ClosedCouetteMassRescale) return
++        cumulative=origin_iteration+iter
++        if (.not.force .and. mod(iter,100)/=0) return
++        if (last_checkpoint==cumulative) return
++        start=MPI_Wtime()
++        write(name,'(a,i6.6,a,i0,a)') 'state_',cumulative,'_rank',myID,'.bin'
++        open(newunit=unit,file=trim(name),access='stream',form='unformatted',status='replace',iostat=ios)
++        if (ios/=0) call MassAbort('R5 physical checkpoint open failed')
++        write(unit) nx,ny,Nvel,cumulative,myID,closed_mass_target,correction_ledger
++        do j=1,ny;do i=1,nx
++            write(unit) ctr(i,j)%x,ctr(i,j)%y,ctr(i,j)%area,ctr(i,j)%conVars, &
++                ctr(i,j)%h_vec,ctr(i,j)%b_vec,GetTau(GetPrimary(ctr(i,j)%conVars))
++        enddo;enddo
++        close(unit)
++        write(name,'(a,i6.6,a,i0,a)') 'restart_',cumulative,'_rank',myID,'.bin'
++        open(newunit=unit,file=trim(name),access='stream',form='unformatted',status='replace',iostat=ios)
++        if (ios/=0) call MassAbort('R5 complete checkpoint open failed')
++        version=4
++        write(unit) version,nx,ny,Nvel,LAP,cumulative,closed_mass_target,correction_ledger,RestartIdentity()
++        do j=1-LAP,ny+LAP;do i=1-LAP,nx+LAP
++            write(unit) ctr(i,j)%conVars,ctr(i,j)%h_vec,ctr(i,j)%b_vec
++        enddo;enddo
++        close(unit)
++        call GetImplicitReferences(mass_ref_h,mass_ref_b)
++        if (myID==0) then
++            write(name,'(a,i6.6,a)') 'reference_',cumulative,'.in'
++            open(newunit=unit,file=trim(name),status='replace')
++            write(unit,'(i0,1x,4(es25.16e3,1x))') reference_epoch_state,mass_ref_h,mass_ref_b,Implicit_ResidualTol,Implicit_MomentTol
++            close(unit)
++        endif
++        last_checkpoint=cumulative
++        checkpoint_seconds=checkpoint_seconds+MPI_Wtime()-start
++    end subroutine
++
++    subroutine SaveRejectedProposal()
++        integer :: unit,i,j
++        character(len=64) :: name
++        write(name,'(a,i0,a)') 'rejected_proposal_rank',myID,'.bin'
++        open(newunit=unit,file=trim(name),access='stream',form='unformatted',status='replace')
++        write(unit) origin_iteration+iter+1,closed_mass_target,correction_ledger,implicit_alpha,r5_macro_alpha,implicit_ncfl_active
++        do j=1,ny;do i=1,nx
++            write(unit) ctr(i,j)%conVars,ctr(i,j)%h_vec,ctr(i,j)%b_vec,delta_w(:,i,j),delta_h(:,i,j),delta_b(:,i,j),tau_tilde(i,j)
++        enddo;enddo
++        close(unit)
++    end subroutine
++
++    subroutine FinalR5State()
++        integer :: unit
++        if (.not.ClosedCouetteMassRescale) return
++        call EvaluateSparseState('final_accepted_state',.true.)
++        call WriteR5Checkpoint(.true.)
++        if (myID==0) then
++            open(newunit=unit,file='R5_status.txt',status='replace')
++            write(unit,'(a)') 'local_steps cumulative_state verified_streak final_original_gate stop_reason'
++            write(unit,'(3(i0,1x),l1,1x,a)') iter,origin_iteration+iter,verified_streak,last_view_pass,trim(r5_stop_reason)
++            close(unit)
++        endif
++    end subroutine
++
++    subroutine RecordR5Cost(begin,output_seconds)
++        real(KREAL),intent(in) :: begin,output_seconds
++        real(KREAL) :: cumulative(9),parts(9),global(9),loop,loopglobal
++        integer :: unit
++        cumulative=[implicit_pr_seconds,implicit_lusgs_seconds,mass_scale_seconds,mass_refresh_seconds, &
++            diag_seconds,checkpoint_seconds,profile_seconds,output_seconds,csv_seconds]
++        parts=cumulative-cost_prev;cost_prev=cumulative
++        call MPI_Allreduce(parts,global,9,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        loop=MPI_Wtime()-begin
++        call MPI_Allreduce(loop,loopglobal,1,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        if (myID==0) then
++            open(newunit=unit,file='cost_steps.csv',position='append',status='unknown')
++            if (iter==1) write(unit,'(a)') 'local_update,cumulative_update,PR,micro_single_sweep,mass_reduce_scale,dependent_refresh,extra_residual_diag,checkpoint_io,profile_wall_io,native_io,observer_dispatch_inclusive,full_loop'
++            write(unit,'(2(i0,","))',advance='no') iter,origin_iteration+iter
++            write(unit,'(*(es25.16e3,:,","))') global,loopglobal
++            close(unit)
++        endif
++    end subroutine
++
++    subroutine RecordTerminalIO(seconds)
++        real(KREAL),intent(in) :: seconds
++        real(KREAL) :: global
++        integer :: unit,cumulative
++        character(len=80) :: name
++        if(.not.ClosedCouetteMassRescale)return
++        cumulative=origin_iteration+iter
++        ! Only the output epoch header changes; W/h/b, M0 and ledger bytes remain untouched.
++        if (ClosedCouetteMassRescale) then
++        write(name,'(a,i0,a)') 'closed_mass_rank',myID,'.bin'
++        open(newunit=unit,file=trim(name),access='stream',form='unformatted',status='old',action='readwrite')
++        write(unit,pos=21) cumulative
++        close(unit)
++        endif
++        call MPI_Allreduce(seconds,global,1,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
++        if (myID==0) then
++            open(newunit=unit,file='terminal_io.csv',status='replace')
++            write(unit,'(a)') 'terminal_native_io_seconds'
++            write(unit,'(es25.16e3)') global
++            close(unit)
++        endif
++    end subroutine
++end module mod_R5Observe
+--- a/src/mod_Residual.f90
++++ b/src/mod_Residual.f90
+@@ -2,8 +2,11 @@
+     use flow_data
+     use Flow_DIS
+     use mpi
++    use Tools,only:GetPrimary,GetTau,GetHeatFlux_Vec,DiscreteMaxwell_Vec,ShakhovPart_Vec
++    use mod_ImplicitCommon,only:ProjectToConservedMoments,MomentConserved
++    use mod_ImplicitMicro,only:EnforceStreamingMomentCompatibility
+     use mod_S2D1, only: IsS2CN2,IsS2Steady
+-    use mod_S2NativeAdapter, only: S2NativeMarkResidual,S2NativeAssembleSteadyResidual,S2NativeDiagnosticEnabled
++    use mod_S2NativeAdapter, only: S2NativeMarkResidual,S2NativeAssembleSteadyResidual,S2NativeDiagnosticEnabled,S2NativePhysicalCollision
+     implicit none
+ 
+ contains
+@@ -16,6 +19,7 @@
+         call AssembleMacroResidual()
+         call AssembleMicroFluxResidual()
+         if(IsS2CN2().or.IsS2Steady()) call S2NativeMarkResidual()
++        if(UnifiedPhysicalOperators)call AssembleSteadyRateResiduals()
+         if(IsS2Steady().or.S2NativeDiagnosticEnabled()) call S2NativeAssembleSteadyResidual()
+     end subroutine ComputeResidual
+ 
+@@ -75,10 +79,12 @@
+     !>Convert physical UGKS step increments into steady residual rates.
+     !--------------------------------------------------
+     subroutine AssembleSteadyRateResiduals()
+-        use mod_ImplicitState, only: rate_w, stream_h, stream_b
++        use mod_ImplicitState, only: rate_w, stream_h, stream_b, &
++            physical_collision_h,physical_collision_b,physical_equilibrium_h,physical_equilibrium_b
+         use, intrinsic :: ieee_arithmetic
+         integer(KINT) :: i, j
+-        real(KREAL) :: dt_inv
++        real(KREAL) :: dt_inv,prim(4),q(2),tau,reference_h(Nvel),reference_b(Nvel),hp(Nvel),bp(Nvel),moment(4)
++        logical::ok,local_ok,global_ok
+ 
+         do j=1,ny
+             do i=1,nx
+@@ -93,6 +99,36 @@
+                 stream_b(:,i,j)=res_b_flux_store(:,i,j)*dt_inv
+             enddo
+         enddo
++        if(.not.UnifiedPhysicalOperators)return
++        if(IsS2CN2())then
++            call S2NativePhysicalCollision(physical_equilibrium_h,physical_equilibrium_b,physical_collision_h,physical_collision_b)
++            local_ok=.true.
++            do j=1,ny;do i=1,nx
++                call MomentConserved(stream_h(:,i,j),stream_b(:,i,j),uVel,vVel,wVel,moment)
++                local_ok=local_ok.and.maxval(abs(moment-rate_w(:,i,j)))/max(1.0_KREAL,maxval(abs(rate_w(:,i,j))))<=2.0e-12_KREAL
++            enddo;enddo
++        else
++            call EnforceStreamingMomentCompatibility(local_ok)
++            do j=1,ny;do i=1,nx
++                ! Publish precisely the prepared R6 physical streaming operator to explicit as well.
++                res_h_flux_store(:,i,j)=stream_h(:,i,j)*ctr(i,j)%dt_local
++                res_b_flux_store(:,i,j)=stream_b(:,i,j)*ctr(i,j)%dt_local
++                prim=GetPrimary(ctr(i,j)%conVars);tau=GetTau(prim)
++                q=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)
++                call DiscreteMaxwell_Vec(physical_equilibrium_h(:,i,j),physical_equilibrium_b(:,i,j),prim)
++                call ShakhovPart_Vec(physical_equilibrium_h(:,i,j),physical_equilibrium_b(:,i,j),q,prim,hp,bp)
++                physical_equilibrium_h(:,i,j)=physical_equilibrium_h(:,i,j)+hp
++                physical_equilibrium_b(:,i,j)=physical_equilibrium_b(:,i,j)+bp
++                reference_h=physical_equilibrium_h(:,i,j);reference_b=physical_equilibrium_b(:,i,j)
++                call ProjectToConservedMoments(physical_equilibrium_h(:,i,j),physical_equilibrium_b(:,i,j), &
++                    ctr(i,j)%conVars,uVel,vVel,wVel,reference_h,reference_b,ok)
++                local_ok=local_ok.and.ok
++                physical_collision_h(:,i,j)=(physical_equilibrium_h(:,i,j)-ctr(i,j)%h_vec)/tau
++                physical_collision_b(:,i,j)=(physical_equilibrium_b(:,i,j)-ctr(i,j)%b_vec)/tau
++            enddo;enddo
++        endif
++        call MPI_Allreduce(local_ok,global_ok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
++        if(.not.global_ok)call MPI_Abort(MPI_COMM_WORLD,444,ierr)
+     end subroutine AssembleSteadyRateResiduals
+ 
+ end module mod_Residual
+--- a/src/mod_S2CartesianMPI.f90
++++ b/src/mod_S2CartesianMPI.f90
+@@ -79,7 +79,7 @@
+         integer::r,e
+         real(KREAL)::spacing(2)
+         character(len=160)::msg
+-        cart_native=trim(TimeIntegration_method)=='S2CN2'.and.S2W2R_shared_predictor==0.and.S2W1_time_centered==0.and.S2W1D_face_time_consistent==0
++        cart_native=(trim(TimeIntegration_method)=='S2CN2'.or.IsHighOrderImplicit()).and.S2W2R_shared_predictor==0.and.S2W1_time_centered==0.and.S2W1D_face_time_consistent==0
+         if(.not.cart_native.and.NP_XY/=1)call CollectiveRequire(.false.,'research midpoint/shared predictors remain single rank',475)
+         if(.not.cart_native)return
+         ! No rank-count whitelist. Every rank must own at least one real cell.
+--- a/src/mod_S2D1.f90
++++ b/src/mod_S2D1.f90
+@@ -5,7 +5,7 @@
+     use Precision, only: KINT,KREAL
+     use flow_para, only: Nx_all,Ny_all,Nu,Nv,ck,Pr,BC_Type,S2W1_wall_mode, &
+         S2W1_wall_ux,S2W1_wall_theta,FluxWall_type,S2PhysicalGas
+-    use control_para, only: dt_global,MAX_ITER,TimeIntegration_method,Nstep_show,S2D1_initial_mode,IsS2Steady
++    use control_para, only: dt_global,MAX_ITER,TimeIntegration_method,Nstep_show,S2D1_initial_mode,IsS2Steady,IsHighOrderImplicit
+     use mpi_para, only: myID
+     use const_para, only: PI,BCconst_periodic
+     use mod_S2MultiscaleWall, only: s2w2_wall_node,s2w2_instantaneous_node
+@@ -49,7 +49,7 @@
+     end function IsS2D1
+ 
+     logical function IsS2CN2()
+-        IsS2CN2=trim(adjustl(TimeIntegration_method))=='S2CN2'
++        IsS2CN2=trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsHighOrderImplicit()
+     end function IsS2CN2
+ 
+     integer pure function ip(i,n)
+--- a/src/mod_S2NativeAdapter.f90
++++ b/src/mod_S2NativeAdapter.f90
+@@ -6,7 +6,7 @@
+     use mod_CorrectedWF2DEquilibrium, only: analytic_maxwellian_2d
+     use mod_S2MPI2IO, only: load_input,legacy_restart_path=>restart_path
+     use mod_S2MPI1Layout, only: slab_lo,slab_hi,communication_clock,communication_seconds
+-    use mod_S2PhysicalGas, only: gas_tau_min,gas_tau_max,gas_tau_calls
++    use mod_S2PhysicalGas, only: gas_tau_min,gas_tau_max,gas_tau_calls,s2_tau
+     use mod_VelocityTables, only: VelocityMode,VelocityCount
+     use mod_TimeIntegrator, only: RecordAcceptedMacroUpdateRate
+     use Precision, only: KREAL,KINT
+@@ -41,6 +41,11 @@
+     interface S2NativePublishState
+         module procedure publish_state
+     end interface
++    public :: S2NativePhysicalCollision
++    interface S2NativePublishWallDiagnostics
++        module procedure PublishWallDiagnostics
++    end interface
++    public :: S2NativePublishWallDiagnostics
+     public :: S2NativeSteadyMaxNorm
+ 
+     real(KREAL),parameter::pi_d=acos(-1.0_KREAL)
+@@ -212,18 +217,18 @@
+         else
+             if(any(BC_Type/=BCconst_periodic))call abort_native('all four boundaries must be periodic',403)
+         endif
+-        if(TimeStep_method/=Time_global_fixed.or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
++        if((TimeStep_method/=Time_global_fixed.and..not.UnifiedPhysicalOperators).or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
+             call abort_native('requires positive fixed dt',404)
+         if(Iflag_DIS/=0.or.Iflag_Fringe/=0)call abort_native('DIS and fringe must be disabled',405)
+         dx=ctr(1,1)%length(1);dy=ctr(1,1)%length(2)
+         tol=1.0e-14_KREAL
+-        if(abs(dx-2.0_KREAL*pi_d/real(Nx_all,KREAL))>tol) &
++        if(.not.UnifiedPhysicalOperators.and.abs(dx-2.0_KREAL*pi_d/real(Nx_all,KREAL))>tol) &
+             call abort_native('requires uniform x Cartesian mesh',406)
+         if(S2W1_wall_mode==1)then
+             if(abs(dy-1.0_KREAL/real(Ny_all,KREAL))>tol) &
+                 call abort_native('S2W1 requires uniform y in [0,1]',406)
+         else
+-            if(abs(dy-2.0_KREAL*pi_d/real(Ny_all,KREAL))>tol)call abort_native('requires uniform [0,2pi]^2 Cartesian mesh',406)
++            if(.not.UnifiedPhysicalOperators.and.abs(dy-2.0_KREAL*pi_d/real(Ny_all,KREAL))>tol)call abort_native('requires uniform [0,2pi]^2 Cartesian mesh',406)
+         endif
+         do j=1,ny+1;do i=1,nx+1
+             if(abs(gridx(i,j)-real(i-1+Block_XY(myID)%Origin_I-1,KREAL)*dx)>tol.or. &
+@@ -456,10 +461,11 @@
+         integer::i,j
+         logical::ok
+         if(.not.(IsS2CN2().or.IsS2Steady()))return
+-        if(.not.initialized.or.evolution_ready)call abort_native('invalid Evolution adapter state',421)
++        if(.not.initialized.or.(evolution_ready.and..not.IsHighOrderImplicit()))call abort_native('invalid Evolution adapter state',421)
+         if(cart_native)call CartesianLedger(total0,wall_balance,cumulative_bottom,cumulative_top)
+         o1_wall_start=MPI_Wtime()
+         call cpu_time(t0c);call pack_state(cw,ch,cb);call cpu_time(t1c);layout_seconds=layout_seconds+t1c-t0c
++        if(IsHighOrderImplicit())targets_ready=.false.
+         if(.not.targets_ready)then
+             call native_build_targets(cw,uVel,vVel,wVel,mh,mb,kxh,kxb,kyh,kyb,eah,eab,kappa,face_error,ok)
+             if(.not.ok)call abort_native('accepted-state target rebuild failed',420)
+@@ -715,6 +721,32 @@
+         close(du)
+     end subroutine w1d_dump_post
+ 
++    subroutine S2NativePhysicalCollision(eqh,eqb,colh,colb)
++        real(KREAL),intent(out)::eqh(:,:,:),eqb(:,:,:),colh(:,:,:),colb(:,:,:)
++        real(KREAL)::q(2),tau,mom(4)
++        integer::i,j
++        logical::ok
++        if(.not.targets_ready.or..not.evolution_ready)call abort_native('stale S2 collision target',441)
++        do j=1,ny;do i=1,nx
++            call heat(cw(:,i,j),ch(i,j,:)-mh(i,j,:),cb(i,j,:)-mb(i,j,:),uVel,vVel,wVel,q,ok)
++            if(.not.ok)call abort_native('S2 physical heat closure',443)
++            tau=s2_tau(cw(:,i,j))
++            eqh(:,i,j)=mh(i,j,:)+kxh(i,j,:)*q(1)+kyh(i,j,:)*q(2)
++            eqb(:,i,j)=mb(i,j,:)+kxb(i,j,:)*q(1)+kyb(i,j,:)*q(2)
++            colh(:,i,j)=(eqh(:,i,j)-ch(i,j,:))/tau
++            colb(:,i,j)=(eqb(:,i,j)-cb(i,j,:))/tau
++            mom=[sum(wVel*colh(:,i,j)),sum(wVel*uVel*colh(:,i,j)),sum(wVel*vVel*colh(:,i,j)), &
++                0.5_KREAL*sum(wVel*((uVel*uVel+vVel*vVel)*colh(:,i,j)+colb(:,i,j)))]
++            ! S2's established gate is on equilibrium conserved moments. A collision
++            ! rate divides this error by tau; check the original dimensionless quantity.
++            if(tau*maxval(abs(mom))/max(1.0_KREAL,maxval(abs(cw(:,i,j))))>gate)then
++                write(*,'(A,I0,2I6,10ES24.16)')'collision diagnostic rank/cell/tau/mom/hgap/bgap:',myID,i,j,tau,mom, &
++                    maxval(abs(eqh(:,i,j)-ch(i,j,:))),maxval(abs(eqb(:,i,j)-cb(i,j,:)))
++                call abort_native('S2 physical collision moment gate',444)
++            endif
++        enddo;enddo
++    end subroutine
++
+     subroutine S2NativeMarkResidual()
+         if(.not.(IsS2CN2().or.IsS2Steady()))return
+         if(.not.evolution_ready)call abort_native('residual assembled without fresh Evolution cache',423)
+--- a/src/mod_Solve.f90
++++ b/src/mod_Solve.f90
+@@ -16,9 +16,12 @@
+         WriteUnsteadyImplicitResidual, ProjectBaseResidualMoments, unsteady_macro_residual, &
+         unsteady_h_residual, unsteady_b_residual
+     use mod_ImplicitState, only: implicit_evolution_seconds,implicit_macro_residual,implicit_h_norm, &
+-        implicit_b_norm,implicit_moment_error
++        implicit_b_norm,implicit_moment_error,r5_force_true_updates
+     use Boundary
+     use InitializeFlow, only: Init_fringe_x
++    use mod_R5Observe,only:StartR5Control,WriteR5Checkpoint,R5ShouldStop,FinalR5State, &
++        AfterR5Accepted,RecordR5Cost,verified_streak,r5_stop_reason,r6_preflight,EvaluateSparseState
++    use mod_NativeWiringChecks,only:DumpPhysicalOperators,RecordWiringState
+     use Output
+     use mod_S2D1, only: IsS2CN2,IsS2Steady
+     use mod_S2NativeAdapter, only: S2NativeApplyUpdate,S2NativeRecordLowOrderStep
+@@ -61,12 +64,26 @@
+         call Compute_InitRes0
+         
+         !call cpu_time(time_pre)
+-        if(.not.IsS2CN2())time_dis = 0.d0
++        if(.not.IsS2CN2().or.IsHighOrderImplicit())time_dis = 0.d0
+         call Reset_Timing()
+         s2_comm_start=communication_seconds
+ 
++        call RecordWiringState()
++        call StartR5Control()
++        call WriteR5Checkpoint(.true.)
++        if(r6_preflight)then
++            call TimeStep()
++            call Set_Ghost_PhysBoundary()
++            if(.not.IsS2CN2())call Interpolation()
++            call Evolution();call ComputeResidual()
++            call EvaluateSparseState('restart_readonly_verification',.true.)
++            r5_stop_reason='readonly_no_update';call FinalR5State();return
++        endif
+         !Time iteration
+         do while(.true.)
++            if(R5ShouldStop())then
++                call FinalR5State();exit
++            endif
+             time_iter_start = MPI_Wtime()
+ 
+             !Calculate the time step
+@@ -87,7 +104,7 @@
+             
+             !Calculate the slope of distribution function
+             time_block_start = MPI_Wtime()
+-            call Interpolation() 
++            if(.not.IsS2CN2())call Interpolation() 
+             time_block_end = MPI_Wtime()
+             time_interp_last = time_block_end-time_block_start
+             time_interp_acc = time_interp_acc+time_interp_last
+@@ -97,6 +114,13 @@
+             call Evolution()
+             call CheckFiniteFlux('Solve_UGKS loop')
+             call ComputeResidual()
++            call DumpPhysicalOperators()
++            block
++                character(len=8)::value
++                integer::status
++                call get_environment_variable('NATIVE_OPERATOR_ONLY',value,status=status)
++                if(status==0.and.trim(value)=='1')exit
++            end block
+             time_block_end = MPI_Wtime()
+             time_evolution_last = time_block_end-time_block_start
+             time_evolution_acc = time_evolution_acc+time_evolution_last
+@@ -111,7 +135,14 @@
+             
+             !Dispatch the accepted-state update while sharing the physical UGKS residual caches.
+             time_block_start = MPI_Wtime()
+-            if(IsS2CN2()) then
++            if(IsHighOrderImplicit())then
++                call ApplySteadyImplicitUpdate(update_accepted)
++                if(.not.update_accepted)then
++                    r5_stop_reason='scientific_rejection'
++                    call WriteR5Checkpoint(.true.);call Output_result()
++                    call AbortSteadyImplicit('high-order implicit rejected; accepted restart saved')
++                endif
++            elseif(IsS2CN2()) then
+                 call S2NativeApplyUpdate(update_accepted)
+                 if(.not.update_accepted) call AbortSteadyImplicit('S2CN2 physical step was rejected')
+             elseif(IsS2Steady()) then
+@@ -148,7 +179,8 @@
+             communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+             
+             iter = iter+1
+-            if((IsS2CN2() .or. trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau' .or. &
++            call RecordWiringState()
++            if(((IsS2CN2().and..not.IsHighOrderImplicit()) .or. trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau' .or. &
+                 IsImplicitUnsteady() .or. Iflag_DIS==1) .and. update_accepted) &
+                 call AdvancePhysicalTime(dt_global)
+             time_end_comm = MPI_Wtime( )
+@@ -160,6 +192,8 @@
+             dsimtime = time_now-time_iter_start
+             simtime = simtime+dsimtime
+             call W3B_Observe(iter,simtime)
++            call AfterR5Accepted()
++            call WriteR5Checkpoint(.false.)
+     
+             !Output the residuals
+             if(mod(iter,Nstep_show)==0) then
+@@ -182,7 +216,10 @@
+                 stop_now=converged_now.or.iter>=Implicit_MaxIter
+             elseif(IsImplicitSteady()) then
+                 converged_now=ImplicitConverged()
++                if(r5_force_true_updates)converged_now=verified_streak>=5
+                 stop_now=converged_now .or. iter>=Implicit_MaxIter
++                if(converged_now)r5_stop_reason='five_distinct_accepted_states_passed'
++                if(.not.converged_now.and.iter>=Implicit_MaxIter)r5_stop_reason='iteration_limit'
+             elseif(IsS2CN2() .or. trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau' .or. &
+                 IsImplicitUnsteady() .or. Iflag_DIS==1) then
+                 converged_now=.false.
+@@ -201,6 +238,8 @@
+                 time_output_last = time_block_end-time_block_start
+                 time_output_acc = time_output_acc+time_output_last
+             end if
++            if(stop_now)call FinalR5State()
++            call RecordR5Cost(time_iter_start,time_output_acc)
+             !Write terminal residual/status; main_UGKS2D writes the terminal field once.
+             if(stop_now) then
+                 if((IsS2Steady().and.S2NativeSteadyNeedsEvaluation()).or. &
+@@ -215,10 +254,17 @@
+                         call TimeStep()
+                         call Set_Ghost_PhysBoundary()
+                         if(IsImplicitSteady())call EnforceImplicitBoundaryMomentCompatibility()
+-                        call Interpolation()
++                        if(.not.IsS2CN2())call Interpolation()
+                     endif
+                     call Evolution()
+                     call ComputeResidual()
++            call DumpPhysicalOperators()
++            block
++                character(len=8)::value
++                integer::status
++                call get_environment_variable('NATIVE_OPERATOR_ONLY',value,status=status)
++                if(status==0.and.trim(value)=='1')exit
++            end block
+                     if(IsS2Steady())converged_now=S2NativeSteadyConverged()
+                 endif
+                 if(mod(iter,Nstep_show)/=0) then
+@@ -500,12 +546,13 @@
+             call Set_Ghost_PhysBoundary() 
+             
+             !Calculate the slope of distribution function
+-            call Interpolation() 
++            if(.not.IsS2CN2())call Interpolation() 
+             
+             !Calculate flux across the interfaces
+             call Evolution()
+             call CheckFiniteFlux('Compute_InitRes0')
+             call ComputeResidual()
++
+ 
+             !Compute initial res. (Update)
+             do j=1,ny
+--- a/src/mod_SteadyImplicit.f90
++++ b/src/mod_SteadyImplicit.f90
+@@ -1,4 +1,5 @@
+ module mod_SteadyImplicit
++    use mod_S2D1,only:IsS2CN2
+     use flow_data
+     use mod_ImplicitState
+     use mod_ImplicitCommon, only: MomentConserved, IsPhysicalState
+@@ -8,6 +9,8 @@
+         EnforceStreamingMomentCompatibility, EnforceAcceptedMomentCompatibility, &
+         EnforceFreestreamGhostMomentCompatibility, EvaluateMicroPointBreakdown, &
+         EvaluatePredictedEquilibriumBreakdown, WeightedNegativeFractionCore=>WeightedNegativeFraction
++    use mod_R5Observe, only: BeginR5Step, AfterNativeResidual, RecordAcceptedLight, CheckR5Policy, SaveRejectedProposal
++    use mod_ClosedCouetteMass
+     use mod_ImplicitDiagnostics
+     use mod_Residual, only: AssembleSteadyRateResiduals
+     use mpi
+@@ -28,7 +31,11 @@
+         call AllocateImplicitState()
+         call BuildStructuredMirrorMaps()
+         call ValidateImplicitSymmetryFaces()
+-        call EnforceAcceptedMomentCompatibility(initialized)
++        if (IsS2CN2().or.((ClosedCouetteMassRescale.or.UnifiedPhysicalOperators) .and. Iflag_InitFlow==Init_Restart)) then
++            call CheckMassState(initialized)
++        else
++            call EnforceAcceptedMomentCompatibility(initialized)
++        endif
+         call InitializeImplicitDiagnostics()
+         if (present(ok)) ok=initialized
+         if (.not.initialized) call AbortSteadyImplicit('initial accepted-state moment projection failed')
+@@ -371,19 +378,40 @@
+ 
+     subroutine ApplySteadyImplicitUpdate(accepted)
+         logical, intent(out) :: accepted
++        if (.not.ClosedCouetteMassRescale) then
++            call BeginR5Step()
++            call ApplyOriginalSteadyImplicitUpdate(accepted)
++            ! Disabled mass option retains its original update without R5 mass diagnostics.
++            return
++        endif
++        call BeginR5Step()
++        call SaveMassTransaction()
++        call ApplyOriginalSteadyImplicitUpdate(accepted)
++        if (accepted) call CheckR5Policy(accepted)
++        if (accepted) call RescaleClosedMass(accepted)
++        if (accepted) call RecordAcceptedLight()
++        if (.not.accepted) call SaveRejectedProposal()
++        if (.not.accepted) call RestoreMassTransaction()
++        call ReleaseMassTransaction()
++    end subroutine ApplySteadyImplicitUpdate
++
++    subroutine ApplyOriginalSteadyImplicitUpdate(accepted)
++        logical, intent(out) :: accepted
+         logical :: ok
+         integer(KINT) :: retry,i,j
+         real(KREAL) :: macro_alpha,start_total,start_stage,moment_local,moment_global,moment_value(4)
+ 
+         accepted=.false.; start_total=MPI_Wtime()
+         call AssembleSteadyRateResiduals()
+-        call EnforceStreamingMomentCompatibility(ok)
++        ok=.true.
++        if(.not.UnifiedPhysicalOperators)call EnforceStreamingMomentCompatibility(ok)
+         if (.not.ok) then
+             implicit_total_seconds=implicit_total_seconds+MPI_Wtime()-start_total
+             return
+         endif
+         call UpdateImplicitResidualDiagnostics()
+-        if (ImplicitConverged()) then
++        call AfterNativeResidual()
++        if (ImplicitConverged() .and. .not.r5_force_true_updates) then
+             call ResetImplicitCorrections()
+             accepted=.true.
+             implicit_total_seconds=implicit_total_seconds+MPI_Wtime()-start_total
+@@ -396,6 +424,7 @@
+             start_stage=MPI_Wtime(); call SolveMacroPR2(ok)
+             implicit_pr_seconds=implicit_pr_seconds+MPI_Wtime()-start_stage
+             if (ok) call BuildPredictedMacroState(macro_alpha,ok)
++            r5_macro_alpha=macro_alpha
+             if (ok) call BuildPredictedEquilibrium(ok)
+             if (ok) then
+                 start_stage=MPI_Wtime(); call SolveMicroLUSGS(ok,freeze_wall_closure=.true.)
+@@ -430,5 +459,5 @@
+         ok=implicit_moment_error<=Implicit_MomentTol
+         accepted=ok
+         implicit_total_seconds=implicit_total_seconds+MPI_Wtime()-start_total
+-    end subroutine ApplySteadyImplicitUpdate
++    end subroutine ApplyOriginalSteadyImplicitUpdate
+ end module mod_SteadyImplicit
+--- a/src/mod_TimeIntegrator.f90
++++ b/src/mod_TimeIntegrator.f90
+@@ -3,6 +3,7 @@
+     use flow_data
+     use Flow_DIS
+     use mpi
++    use mod_ImplicitCommon,only:ProjectToConservedMoments
+     use tools
+     use, intrinsic :: ieee_arithmetic
+     implicit none
+@@ -243,6 +244,8 @@
+         real(KREAL)                                     :: h_flux_rhs,b_flux_rhs
+         real(KREAL)                                     :: implicit_inv,relax_rate
+         integer(KINT)                                   :: k
++        logical::ok
++        real(KREAL)::rh(Nvel),rb(Nvel)
+ 
+         !Calculate heat flux at t=t^n directly from flattened cell-center VDF views.
+         qf = GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim_old)
+@@ -261,6 +264,14 @@
+             B_vec(k) = B_vec(k)+B_plus_vec(k)
+         enddo
+ 
++        if(UnifiedPhysicalOperators)then
++            rh=H_old_vec;rb=B_old_vec
++            call ProjectToConservedMoments(H_old_vec,B_old_vec,GetConserved(prim_old),uVel,vVel,wVel,rh,rb,ok)
++            if(.not.ok)call MPI_Abort(MPI_COMM_WORLD,444,ierr)
++            rh=H_vec;rb=B_vec
++            call ProjectToConservedMoments(H_vec,B_vec,ctr(i,j)%conVars,uVel,vVel,wVel,rh,rb,ok)
++            if(.not.ok)call MPI_Abort(MPI_COMM_WORLD,444,ierr)
++        endif
+         !Update micro distribution values through 1D views.
+         implicit_inv = 1.0_KREAL/(1.0_KREAL+0.5_KREAL*dt/tau)
+         relax_rate = dt*Xlamd(i,j)

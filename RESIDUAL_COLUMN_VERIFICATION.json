@@ -1,0 +1,26 @@
+{
+  "low_explicit": {
+    "full_state_bitwise_equal": true,
+    "original_residual_fields_equal_except_timing": true,
+    "coefficient_matches_existing_ledger": "not_applicable_disabled",
+    "restart_bitwise_equal": "not_tested_this_revision",
+    "file_set_unchanged": true
+  },
+  "low_implicit": {
+    "full_state_bitwise_equal": true,
+    "original_residual_fields_equal_except_timing": true,
+    "coefficient_matches_existing_ledger": true,
+    "restart_bitwise_equal": true,
+    "file_set_unchanged": true
+  },
+  "high_implicit": {
+    "full_state_bitwise_equal": true,
+    "original_residual_fields_equal_except_timing": true,
+    "coefficient_matches_existing_ledger": true,
+    "restart_bitwise_equal": true,
+    "file_set_unchanged": true
+  },
+  "protected_files_unchanged": 209,
+  "numerical_kernels_unchanged": true,
+  "MPI_wall_seconds": 14.05057025
+}

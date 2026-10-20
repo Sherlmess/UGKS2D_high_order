@@ -1,4 +1,5 @@
 module mod_SteadyImplicit
+    use mod_S2D1,only:IsS2CN2
     use flow_data
     use mod_ImplicitState
     use mod_ImplicitCommon, only: MomentConserved, IsPhysicalState
@@ -8,6 +9,8 @@ module mod_SteadyImplicit
         EnforceStreamingMomentCompatibility, EnforceAcceptedMomentCompatibility, &
         EnforceFreestreamGhostMomentCompatibility, EvaluateMicroPointBreakdown, &
         EvaluatePredictedEquilibriumBreakdown, WeightedNegativeFractionCore=>WeightedNegativeFraction
+    use mod_R5Observe, only: BeginR5Step, AfterNativeResidual, RecordAcceptedLight, CheckR5Policy, SaveRejectedProposal
+    use mod_ClosedCouetteMass
     use mod_ImplicitDiagnostics
     use mod_Residual, only: AssembleSteadyRateResiduals
     use mpi
@@ -28,7 +31,11 @@ contains
         call AllocateImplicitState()
         call BuildStructuredMirrorMaps()
         call ValidateImplicitSymmetryFaces()
-        call EnforceAcceptedMomentCompatibility(initialized)
+        if (IsS2CN2().or.((ClosedCouetteMassRescale.or.UnifiedPhysicalOperators) .and. Iflag_InitFlow==Init_Restart)) then
+            call CheckMassState(initialized)
+        else
+            call EnforceAcceptedMomentCompatibility(initialized)
+        endif
         call InitializeImplicitDiagnostics()
         if (present(ok)) ok=initialized
         if (.not.initialized) call AbortSteadyImplicit('initial accepted-state moment projection failed')
@@ -371,19 +378,40 @@ contains
 
     subroutine ApplySteadyImplicitUpdate(accepted)
         logical, intent(out) :: accepted
+        if (.not.ClosedCouetteMassRescale) then
+            call BeginR5Step()
+            call ApplyOriginalSteadyImplicitUpdate(accepted)
+            ! Disabled mass option retains its original update without R5 mass diagnostics.
+            return
+        endif
+        call BeginR5Step()
+        call SaveMassTransaction()
+        call ApplyOriginalSteadyImplicitUpdate(accepted)
+        if (accepted) call CheckR5Policy(accepted)
+        if (accepted) call RescaleClosedMass(accepted)
+        if (accepted) call RecordAcceptedLight()
+        if (.not.accepted) call SaveRejectedProposal()
+        if (.not.accepted) call RestoreMassTransaction()
+        call ReleaseMassTransaction()
+    end subroutine ApplySteadyImplicitUpdate
+
+    subroutine ApplyOriginalSteadyImplicitUpdate(accepted)
+        logical, intent(out) :: accepted
         logical :: ok
         integer(KINT) :: retry,i,j
         real(KREAL) :: macro_alpha,start_total,start_stage,moment_local,moment_global,moment_value(4)
 
         accepted=.false.; start_total=MPI_Wtime()
         call AssembleSteadyRateResiduals()
-        call EnforceStreamingMomentCompatibility(ok)
+        ok=.true.
+        if(.not.UnifiedPhysicalOperators)call EnforceStreamingMomentCompatibility(ok)
         if (.not.ok) then
             implicit_total_seconds=implicit_total_seconds+MPI_Wtime()-start_total
             return
         endif
         call UpdateImplicitResidualDiagnostics()
-        if (ImplicitConverged()) then
+        call AfterNativeResidual()
+        if (ImplicitConverged() .and. .not.r5_force_true_updates) then
             call ResetImplicitCorrections()
             accepted=.true.
             implicit_total_seconds=implicit_total_seconds+MPI_Wtime()-start_total
@@ -396,6 +424,7 @@ contains
             start_stage=MPI_Wtime(); call SolveMacroPR2(ok)
             implicit_pr_seconds=implicit_pr_seconds+MPI_Wtime()-start_stage
             if (ok) call BuildPredictedMacroState(macro_alpha,ok)
+            r5_macro_alpha=macro_alpha
             if (ok) call BuildPredictedEquilibrium(ok)
             if (ok) then
                 start_stage=MPI_Wtime(); call SolveMicroLUSGS(ok,freeze_wall_closure=.true.)
@@ -430,5 +459,5 @@ contains
         ok=implicit_moment_error<=Implicit_MomentTol
         accepted=ok
         implicit_total_seconds=implicit_total_seconds+MPI_Wtime()-start_total
-    end subroutine ApplySteadyImplicitUpdate
+    end subroutine ApplyOriginalSteadyImplicitUpdate
 end module mod_SteadyImplicit

@@ -1,9 +1,9 @@
 module mod_ImplicitMacro
     use flow_data
     use Tools, only: GetPrimary, GetTau
-    use mod_ImplicitState, only: rate_w, delta_w, w_tilde, implicit_ncfl_active
+    use mod_ImplicitState, only: rate_w, delta_w, w_tilde, implicit_ncfl_active,macro_pr_passes
     use mod_ImplicitCommon, only: IsPhysicalState, EulerFluxNormal, PseudoTimeStep
-    use mod_ImplicitBoundary, only: GetMacroBoundaryDelta, ResolveImplicitBoundaryType
+    use mod_ImplicitBoundary, only: GetMacroBoundaryDelta, ResolveImplicitBoundaryType, ZhuMovingWallMap
     use mpi_wrapper, only: MPIExchangeDeltaMacro
     use mpi
     use, intrinsic :: ieee_arithmetic
@@ -17,7 +17,8 @@ contains
         integer(KINT) :: ni,nj,boundary_type
         logical :: physical_boundary
         real(KREAL) :: nx_out,ny_out,face_length,projected_distance
-        real(KREAL) :: wi(4),wj(4),primi(4),primj(4)
+        real(KREAL) :: wi(4),wj(4),primi(4),primj(4),wall_prim(4)
+        integer(KINT) :: face_number
         real(KREAL) :: rhoi,rhoj,rho_avg,u_avg,v_avg,p_i,p_j,p_avg
         real(KREAL) :: tau_i,tau_j,mu_avg,sound_speed
 
@@ -26,6 +27,12 @@ contains
         wi=ctr(i,j)%conVars
         if (physical_boundary) then
             wj=wi
+            if (Implicit_ZhuMovingWall .and. boundary_type==BCconst_wall_isothermal) then
+                face_number=2*(dirc-1)+1
+                if (side==Rside) face_number=face_number+1
+                wall_prim=WallPrimary(face_number)
+                wj=ZhuMovingWallMap(wi,wall_prim(2),wall_prim(3))
+            endif
             projected_distance=ctr(i,j)%length(dirc)
         else
             wj=ctr(ni,nj)%conVars
@@ -39,11 +46,7 @@ contains
         p_i=0.5_KREAL*primi(1)/primi(4)
         p_j=0.5_KREAL*primj(1)/primj(4)
         p_avg=0.5_KREAL*(p_i+p_j)
-        if(IsS2Steady())then
-            tau_i=0.1_KREAL;tau_j=0.1_KREAL
-        else
-            tau_i=GetTau(primi);tau_j=GetTau(primj)
-        endif
+        tau_i=GetTau(primi); tau_j=GetTau(primj)
         mu_avg=0.5_KREAL*(tau_i*p_i+tau_j*p_j)
         sound_speed=sqrt(gamma*p_avg/rho_avg)
         gamma_face=abs(u_avg*nx_out+v_avg*ny_out)+sound_speed+ &
@@ -61,6 +64,7 @@ contains
         ok=.false.
         call MPIExchangeDeltaMacro(delta_w)
         do sweep=1,Implicit_MacroSweeps
+            macro_pr_passes=macro_pr_passes+1
             local_ok=.true.
             do j=1,ny
                 do i=1,nx
@@ -187,7 +191,7 @@ contains
         logical, intent(out) :: ok
         integer(KINT) :: dirc,side,ni,nj,boundary_type
         logical :: physical_boundary
-        real(KREAL) :: nx_out,ny_out,wi(4),wj(4),flux_old(4),flux_new(4),delta_t_i(4),delta_t_j(4)
+        real(KREAL) :: nx_out,ny_out,wi(4),wj(4),flux_old(4),flux_new(4),delta_t_i(4),delta_t_j(4),wall_prim(4)
 
         call FaceNumberToDirection(face_number,dirc,side)
         call GetFaceGeometry(i,j,dirc,side,ni,nj,nx_out,ny_out,face_length, &
@@ -195,7 +199,11 @@ contains
         wi=ctr(i,j)%conVars
         if (physical_boundary) then
             wj=wi
-            call GetMacroBoundaryDelta(boundary_type,nx_out,ny_out,delta_w(:,i,j),delta_neighbor,ok)
+            if (Implicit_ZhuMovingWall .and. boundary_type==BCconst_wall_isothermal) then
+                wall_prim=WallPrimary(face_number)
+                wj=ZhuMovingWallMap(wi,wall_prim(2),wall_prim(3))
+            endif
+            call GetMacroBoundaryDelta(boundary_type,nx_out,ny_out,delta_w(:,i,j),delta_neighbor,ok,face_number)
             if (.not.ok) return
         else
             wj=ctr(ni,nj)%conVars

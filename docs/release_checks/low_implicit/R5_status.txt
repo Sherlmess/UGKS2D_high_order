@@ -1,0 +1,2 @@
+local_steps cumulative_state verified_streak final_original_gate stop_reason
+2 2 0 F iteration_limit

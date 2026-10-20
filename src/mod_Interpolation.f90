@@ -37,6 +37,12 @@ module mod_Interpolation
         !i direction
         do j=1-GHOST+1,ny+GHOST-1
             do i=1-GHOST+1,nx+GHOST-1
+                if(UnifiedPhysicalOperators)then
+                    if(IP_Y==0.and.BC_Type(3)==2.and.j<1)cycle
+                    if(IP_Y==NP_Y-1.and.BC_Type(4)==2.and.j>ny)cycle
+                    if(IP_X==0.and.BC_Type(1)==2.and.i<=1)cycle
+                    if(IP_X==NP_X-1.and.BC_Type(2)==2.and.i>=nx)cycle
+                endif
                 call InterpInner(ctr(i-1,j),ctr(i,j),ctr(i+1,j),IDIRC)
             end do
         end do
@@ -44,6 +50,12 @@ module mod_Interpolation
         !j direction
         do j=1-GHOST+1,ny+GHOST-1
             do i=1-GHOST+1,nx+GHOST-1
+                if(UnifiedPhysicalOperators)then
+                    if(IP_X==0.and.BC_Type(1)==2.and.i<1)cycle
+                    if(IP_X==NP_X-1.and.BC_Type(2)==2.and.i>nx)cycle
+                    if(IP_Y==0.and.BC_Type(3)==2.and.j<=1)cycle
+                    if(IP_Y==NP_Y-1.and.BC_Type(4)==2.and.j>=ny)cycle
+                endif
                 call InterpInner(ctr(i,j-1),ctr(i,j),ctr(i,j+1),JDIRC)
             end do
         end do

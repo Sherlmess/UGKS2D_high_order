@@ -1,5 +1,7 @@
 /obj/
 /bin/
 /runs/
+/run_static/
 __pycache__/
 *.pyc
+.DS_Store

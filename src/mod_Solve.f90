@@ -1,5 +1,8 @@
 module Solver
+    use mod_ClosedCouetteMass,only:mass_scale
+    use mod_S2MPI1Layout,only:communication_seconds,communication_clock
     use flow_data
+    use mod_W3BObserver, only: W3B_Init, W3B_Observe
     use Flow_DIS
     use mpi
     use mpi_wrapper
@@ -14,9 +17,12 @@ module Solver
         WriteUnsteadyImplicitResidual, ProjectBaseResidualMoments, unsteady_macro_residual, &
         unsteady_h_residual, unsteady_b_residual
     use mod_ImplicitState, only: implicit_evolution_seconds,implicit_macro_residual,implicit_h_norm, &
-        implicit_b_norm,implicit_moment_error
+        implicit_b_norm,implicit_moment_error,r5_force_true_updates
     use Boundary
     use InitializeFlow, only: Init_fringe_x
+    use mod_R5Observe,only:StartR5Control,WriteR5Checkpoint,R5ShouldStop,FinalR5State, &
+        AfterR5Accepted,RecordR5Cost,verified_streak,r5_stop_reason,r6_preflight,EvaluateSparseState
+    use mod_NativeWiringChecks,only:DumpPhysicalOperators,RecordWiringState
     use Output
     use mod_S2D1, only: IsS2CN2,IsS2Steady
     use mod_S2NativeAdapter, only: S2NativeApplyUpdate,S2NativeRecordLowOrderStep
@@ -25,6 +31,7 @@ module Solver
     use mod_S2SteadyIteration, only: S2NativeApplySteadyUpdate
     use, intrinsic :: ieee_arithmetic
     implicit none
+    real(KREAL), save :: s2_loop_start=0.0_KREAL,s2_loop_total=0.0_KREAL,s2_comm_start=0.0_KREAL,s2_comm_loop=0.0_KREAL
     real(KREAL), save                               :: time_step_last = 0.0_KREAL
     real(KREAL), save                               :: time_boundary_last = 0.0_KREAL
     real(KREAL), save                               :: time_interp_last = 0.0_KREAL
@@ -39,6 +46,7 @@ module Solver
     real(KREAL), save                               :: time_update_acc = 0.0_KREAL
     real(KREAL), save                               :: time_mpi_acc = 0.0_KREAL
     real(KREAL), save                               :: time_output_acc = 0.0_KREAL
+    logical, save :: stop_requested_by_user=.false.
     logical, save                                   :: residual_output_initialized = .false.
     logical, save                                   :: timing_output_initialized = .false.
     
@@ -49,17 +57,34 @@ contains
         real(KREAL)                         :: time_iter_start, time_block_start, time_block_end
         logical                             :: update_accepted,stop_now,converged_now
 
+        s2_loop_start=MPI_Wtime()
+        call W3B_Init()
         residual_output_initialized=.false.
         timing_output_initialized=.false.
         !Compute Res0 for the initial steady flow
         call Compute_InitRes0
         
         !call cpu_time(time_pre)
-        time_dis = 0.d0
+        if(.not.IsS2CN2().or.IsHighOrderImplicit())time_dis = 0.d0
         call Reset_Timing()
+        s2_comm_start=communication_seconds
 
+        call RecordWiringState()
+        call StartR5Control()
+        call WriteR5Checkpoint(.true.)
+        if(r6_preflight)then
+            call TimeStep()
+            call Set_Ghost_PhysBoundary()
+            if(.not.IsS2CN2())call Interpolation()
+            call Evolution();call ComputeResidual()
+            call EvaluateSparseState('restart_readonly_verification',.true.)
+            r5_stop_reason='readonly_no_update';call FinalR5State();return
+        endif
         !Time iteration
         do while(.true.)
+            if(R5ShouldStop())then
+                call FinalR5State();exit
+            endif
             time_iter_start = MPI_Wtime()
 
             !Calculate the time step
@@ -80,7 +105,7 @@ contains
             
             !Calculate the slope of distribution function
             time_block_start = MPI_Wtime()
-            call Interpolation() 
+            if(.not.IsS2CN2())call Interpolation() 
             time_block_end = MPI_Wtime()
             time_interp_last = time_block_end-time_block_start
             time_interp_acc = time_interp_acc+time_interp_last
@@ -90,6 +115,13 @@ contains
             call Evolution()
             call CheckFiniteFlux('Solve_UGKS loop')
             call ComputeResidual()
+            call DumpPhysicalOperators()
+            block
+                character(len=8)::value
+                integer::status
+                call get_environment_variable('NATIVE_OPERATOR_ONLY',value,status=status)
+                if(status==0.and.trim(value)=='1')exit
+            end block
             time_block_end = MPI_Wtime()
             time_evolution_last = time_block_end-time_block_start
             time_evolution_acc = time_evolution_acc+time_evolution_last
@@ -104,7 +136,14 @@ contains
             
             !Dispatch the accepted-state update while sharing the physical UGKS residual caches.
             time_block_start = MPI_Wtime()
-            if(IsS2CN2()) then
+            if(IsHighOrderImplicit())then
+                call ApplySteadyImplicitUpdate(update_accepted)
+                if(.not.update_accepted)then
+                    r5_stop_reason='scientific_rejection'
+                    call WriteR5Checkpoint(.true.);call Output_result()
+                    call AbortSteadyImplicit('high-order implicit rejected; accepted restart saved')
+                endif
+            elseif(IsS2CN2()) then
                 call S2NativeApplyUpdate(update_accepted)
                 if(.not.update_accepted) call AbortSteadyImplicit('S2CN2 physical step was rejected')
             elseif(IsS2Steady()) then
@@ -136,10 +175,13 @@ contains
             call MPIUpdate_Conner_VDF()
             
             !Synchronize different processor 
+            communication_clock=MPI_Wtime()
             call MPI_Barrier(MPI_COMM_WORLD,ierr)
+            communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
             
             iter = iter+1
-            if((IsS2CN2() .or. trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau' .or. &
+            call RecordWiringState()
+            if(((IsS2CN2().and..not.IsHighOrderImplicit()) .or. trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau' .or. &
                 IsImplicitUnsteady() .or. Iflag_DIS==1) .and. update_accepted) &
                 call AdvancePhysicalTime(dt_global)
             time_end_comm = MPI_Wtime( )
@@ -150,19 +192,22 @@ contains
             dcommtime = time_mpi_last
             dsimtime = time_now-time_iter_start
             simtime = simtime+dsimtime
+            call W3B_Observe(iter,simtime)
+            call AfterR5Accepted()
+            call WriteR5Checkpoint(.false.)
     
             !Output the residuals
             if(mod(iter,Nstep_show)==0) then
                 if(IsS2Steady())then
                     call WriteAcceptedStateAdmissibilityDiagnostics('S2Steady')
                 elseif(IsImplicitSteady()) then
-                    call WriteImplicitResidual(simtime)
+                    call WriteImplicitResidual(simtime,merge(mass_scale-1.0_KREAL,0.0_KREAL,ClosedCouetteMassRescale))
                     call WriteAcceptedStateAdmissibilityDiagnostics('ImplicitSteady')
                 elseif(IsImplicitUnsteady()) then
                     call WriteUnsteadyImplicitResidual()
                 else
                     call Write_residuals
-                    call WriteAcceptedStateAdmissibilityDiagnostics('Explicit')
+                    if(.not.IsS2CN2().or.S2Diagnostics)call WriteAcceptedStateAdmissibilityDiagnostics('Explicit')
                 endif
             end if
     
@@ -172,7 +217,10 @@ contains
                 stop_now=converged_now.or.iter>=Implicit_MaxIter
             elseif(IsImplicitSteady()) then
                 converged_now=ImplicitConverged()
+                if(r5_force_true_updates)converged_now=verified_streak>=5
                 stop_now=converged_now .or. iter>=Implicit_MaxIter
+                if(converged_now)r5_stop_reason='five_distinct_accepted_states_passed'
+                if(.not.converged_now.and.iter>=Implicit_MaxIter)r5_stop_reason='iteration_limit'
             elseif(IsS2CN2() .or. trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau' .or. &
                 IsImplicitUnsteady() .or. Iflag_DIS==1) then
                 converged_now=.false.
@@ -186,11 +234,20 @@ contains
             if (mod(iter,Nstep_write)==0 .and. .not.stop_now) then
                 !call Write_flow
                 time_block_start = MPI_Wtime()
-                call Output_result()
+                call Output_result(.false.)
                 time_block_end = MPI_Wtime()
                 time_output_last = time_block_end-time_block_start
                 time_output_acc = time_output_acc+time_output_last
             end if
+            if(Nstep_restart>0.and..not.stop_now)then
+                if(mod(iter,max(1,Nstep_restart))==0)then
+                    time_block_start=MPI_Wtime()
+                    call Output_restart_only()
+                    time_output_acc=time_output_acc+MPI_Wtime()-time_block_start
+                endif
+            endif
+            if(stop_now)call FinalR5State()
+            call RecordR5Cost(time_iter_start,time_output_acc)
             !Write terminal residual/status; main_UGKS2D writes the terminal field once.
             if(stop_now) then
                 if((IsS2Steady().and.S2NativeSteadyNeedsEvaluation()).or. &
@@ -205,17 +262,24 @@ contains
                         call TimeStep()
                         call Set_Ghost_PhysBoundary()
                         if(IsImplicitSteady())call EnforceImplicitBoundaryMomentCompatibility()
-                        call Interpolation()
+                        if(.not.IsS2CN2())call Interpolation()
                     endif
                     call Evolution()
                     call ComputeResidual()
+            call DumpPhysicalOperators()
+            block
+                character(len=8)::value
+                integer::status
+                call get_environment_variable('NATIVE_OPERATOR_ONLY',value,status=status)
+                if(status==0.and.trim(value)=='1')exit
+            end block
                     if(IsS2Steady())converged_now=S2NativeSteadyConverged()
                 endif
                 if(mod(iter,Nstep_show)/=0) then
                     if(IsS2Steady())then
                         continue
                     elseif(IsImplicitSteady()) then
-                        call WriteImplicitResidual(simtime)
+                        call WriteImplicitResidual(simtime,merge(mass_scale-1.0_KREAL,0.0_KREAL,ClosedCouetteMassRescale))
                     elseif(IsImplicitUnsteady()) then
                         call WriteUnsteadyImplicitResidual()
                     else
@@ -228,6 +292,8 @@ contains
             
         end do
       
+        s2_loop_total=MPI_Wtime()-s2_loop_start
+        s2_comm_loop=communication_seconds-s2_comm_start
     end subroutine Solve_UGKS
 
     subroutine AdvancePhysicalTime(accepted_dt)
@@ -236,7 +302,19 @@ contains
     end subroutine AdvancePhysicalTime
 
     logical function NonsteadyStopRequested()
-        NonsteadyStopRequested=iter>=MAX_ITER
+        integer::local_stop,global_stop,local_request,global_request
+        logical::request
+        inquire(file='STOP_REQUEST',exist=request)
+        local_request=merge(1,0,request)
+        communication_clock=MPI_Wtime()
+        call MPI_Allreduce(local_request,global_request,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        stop_requested_by_user=global_request/=0
+        local_stop=merge(1,0,request.or.iter>=MAX_ITER)
+        communication_clock=MPI_Wtime()
+        call MPI_Allreduce(local_stop,global_stop,1,MPI_INTEGER,MPI_MAX,MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        NonsteadyStopRequested=global_stop/=0
     end function NonsteadyStopRequested
 
     subroutine WriteConvergenceStatus(converged)
@@ -258,6 +336,10 @@ contains
         write(105,'(A,1X,L1,1X,I0,1X,1P,E18.9)') trim(adjustl(TimeIntegration_method)), &
             converged,iter,maximum_residual
         close(105)
+        if(stop_requested_by_user)then
+            write(*,'(A,I0)')'Controlled STOP_REQUEST at accepted step ',iter
+            return
+        endif
         if (.not.converged) write(*,'(A,A,A,I0,A,1P,E16.8)') &
             'WARNING: ',trim(adjustl(TimeIntegration_method)),' reached iteration limit at ',iter, &
             ' with max residual ',maximum_residual
@@ -353,8 +435,8 @@ contains
             !Write file
             if(.not.residual_output_initialized) then
                 open(unit=101,file='Residuals.plt',status="replace",action="write") !Open residual file
-                write(101,'(a)') "VARIABLES = iter, resRho, resRhoU, resRhoV, resE, simtime" !Global L2-normalized residuals
-                write(101,"(I15,5E15.7)") iter,res,simTime
+                write(101,'(a)') "VARIABLES = iter, resRho, resRhoU, resRhoV, resE, simtime, c_minus_1, mass_rescale_enabled" !Global L2-normalized residuals
+                write(101,"(I15,5E15.7,2ES25.16E3)") iter,res,simTime,0.0_KREAL,0.0_KREAL
                 close(101)
 
                 open(unit=102,file='Residuals_detail.plt',status="replace",action="write")
@@ -362,17 +444,17 @@ contains
                     "numRho, numRhoU, numRhoV, numE, denRho, denRhoU, denRhoV, denE, " // &
                     "rmsRho, rmsRhoU, rmsRhoV, rmsE, maxRho, maxRhoU, maxRhoV, maxE, " // &
                     "relativeRho, relativeRhoU, relativeRhoV, relativeE, " // &
-                    "absoluteRho, absoluteRhoU, absoluteRhoV, absoluteE, simtime"
-                write(102,"(I15,29E15.7)") iter,res,res_num,res_den,res_rms,res_max,res_relative,res_absolute,simTime
+                    "absoluteRho, absoluteRhoU, absoluteRhoV, absoluteE, simtime, c_minus_1, mass_rescale_enabled"
+                write(102,"(I15,29E15.7,2ES25.16E3)") iter,res,res_num,res_den,res_rms,res_max,res_relative,res_absolute,simTime,0.0_KREAL,0.0_KREAL
                 close(102)
                 residual_output_initialized=.true.
             else
                 open(unit=101,file='Residuals.plt',status="old",action="write",position="append") !Open residual file
-                write(101,"(I15,5E15.7)") iter,res,simTime
+                write(101,"(I15,5E15.7,2ES25.16E3)") iter,res,simTime,0.0_KREAL,0.0_KREAL
                 close(101)
 
                 open(unit=102,file='Residuals_detail.plt',status="old",action="write",position="append")
-                write(102,"(I15,29E15.7)") iter,res,res_num,res_den,res_rms,res_max,res_relative,res_absolute,simTime
+                write(102,"(I15,29E15.7,2ES25.16E3)") iter,res,res_num,res_den,res_rms,res_max,res_relative,res_absolute,simTime,0.0_KREAL,0.0_KREAL
                 close(102)
             endif   
         endif
@@ -472,12 +554,13 @@ contains
             call Set_Ghost_PhysBoundary() 
             
             !Calculate the slope of distribution function
-            call Interpolation() 
+            if(.not.IsS2CN2())call Interpolation() 
             
             !Calculate flux across the interfaces
             call Evolution()
             call CheckFiniteFlux('Compute_InitRes0')
             call ComputeResidual()
+
 
             !Compute initial res. (Update)
             do j=1,ny

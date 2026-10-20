@@ -5,12 +5,14 @@ module InitializeFlow
     use flow_para
     use control_para, only: IsImplicitSteady, IsImplicitUnsteady, PeriodicComparisonProfile
     use mod_S2D1, only: IsS2CN2,IsS2Steady,S2InitVelocity => init_velocity
-    use mod_S2NativeAdapter, only: S2NativeInitializeState
+    use mod_S2NativeAdapter, only: S2NativeInitializeState,S2NativeReadMetadata
     use mod_S2SteadyIteration, only: InitializeS2Steady
     use Flow_DIS
     use tools
     use Boundary
     use mod_ImplicitBoundary, only: BuildStructuredMirrorMaps, ValidateImplicitMaxwellFaces
+    use mod_ClosedCouetteMass, only: ReadMassRestart,InitializeClosedMass
+    use mod_ImplicitMicro, only: EnforceAcceptedMomentCompatibility
     use mod_SteadyImplicit, only: InitializeSteadyImplicit
     use mod_UnsteadyImplicit, only: AllocateUnsteadyImplicitState, FillFringeAtStep
     use mpi
@@ -27,6 +29,7 @@ contains
         call InitVelocity()                     !Initialize uSpace, vSpace and weights
         if(IsImplicitSteady() .or. IsImplicitUnsteady()) call ValidateImplicitMaxwellFaces()
         call InitFlowField()                    !Set the initial value
+        if(ClosedCouetteMassRescale.and.Iflag_InitFlow==Init_Restart)call ReadMassRestart()
         call Init_fringe_x()                    !Initialize fringe function
         if(bc_type(1)==BCconst_inflow .or. &
            (Iflag_DIS==1 .and. DISBC_type==DISBC_inflow_TS)) then !Initialize inflow/TS boundary data
@@ -38,7 +41,12 @@ contains
         call MPIUpdate_CellVDF()
         call MPIUpdate_Conner_conVars()
         call MPIUpdate_Conner_VDF()
-        if(IsImplicitSteady() .or. IsImplicitUnsteady()) call InitializeSteadyImplicit()
+        if(IsImplicitSteady() .or. IsImplicitUnsteady().or.UnifiedPhysicalOperators) call InitializeSteadyImplicit()
+        if((IsImplicitSteady().or.UnifiedPhysicalOperators).and.Implicit_InitHaloResync)then
+            call MPIUpdate_CellConVars();call MPIUpdate_CellVDF()
+            call MPIUpdate_Conner_conVars();call MPIUpdate_Conner_VDF()
+        endif
+        if(ClosedCouetteMassRescale)call InitializeClosedMass()
         if(IsS2Steady()) call InitializeS2Steady()
         if(IsImplicitUnsteady()) call AllocateUnsteadyImplicitState()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
@@ -106,6 +114,16 @@ contains
         allocate(cell_b0_store(Nvel,1-LAP:nx+LAP,1-LAP:ny+LAP))
         allocate(cell_res_h0_store(Nvel,1-LAP:nx+LAP,1-LAP:ny+LAP))
         allocate(cell_res_b0_store(Nvel,1-LAP:nx+LAP,1-LAP:ny+LAP))
+        ! Wall-exterior slots are not physical states, but complete R6 restart
+        ! snapshots include their storage. Initialize it deterministically.
+        if(UnifiedPhysicalOperators)then
+            cell_h_store=0;cell_b_store=0;cell_h0_store=0;cell_b0_store=0
+            cell_res_h0_store=0;cell_res_b0_store=0
+            do j=1-LAP,ny+LAP;do i=1-LAP,nx+LAP
+                ctr(i,j)%conVars=0;ctr(i,j)%conVars0=0;ctr(i,j)%sw=0
+                ctr(i,j)%res_conVars0=0;ctr(i,j)%dt_local=dt_global
+            enddo;enddo
+        endif
         cell_sh_store = 0.0_KREAL
         cell_sb_store = 0.0_KREAL
 
@@ -257,15 +275,29 @@ contains
         if(myID==0) then
             !check whether the grid file exists
             inquire(file="Mesh2d.dat",exist=ext1)
+            if(.not.ext1.and.S2CartesianMesh.and.IsS2CN2())then
+                do j=1,Ny_all+1;do i=1,Nx_all+1
+                    gridx_all(i,j)=real(i-1,KREAL)*(2.0_KREAL*acos(-1.0_KREAL)/real(Nx_all,KREAL))
+                    if(S2W1_wall_mode==1)then
+                        gridy_all(i,j)=real(j-1,KREAL)/real(Ny_all,KREAL)
+                    else
+                        gridy_all(i,j)=real(j-1,KREAL)*(2.0_KREAL*acos(-1.0_KREAL)/real(Ny_all,KREAL))
+                    endif
+                enddo;enddo
+                open(1,file='Mesh2d.dat',form='unformatted',status='new')
+                write(1)Nx_all+1,Ny_all+1
+                write(1)gridx_all,gridy_all
+                close(1);ext1=.true.
+            endif
             if(.not. ext1) then           ! the file does not exist
-                stop 'Error: Mesh2d.dat does not exist.'
+                call MPI_Abort(MPI_COMM_WORLD,473,ierr)
             endif
             
             !read global mesh
             open(1,file='Mesh2d.dat',form='unformatted')
             !read(1)
             read(1) nx0,ny0
-            if(nx0/=nx_all+1 .or. ny0/=ny_all+1) stop 'Error: wrong cell numbers'
+            if(nx0/=nx_all+1 .or. ny0/=ny_all+1)call MPI_Abort(MPI_COMM_WORLD,474,ierr)
             read(1) ((gridx_all(i,j),i=1,nx0),j=1,ny0),((gridy_all(i,j),i=1,nx0),j=1,ny0) 
             ! x  y  gridx_all  gridy_all 
             close(1)
@@ -419,9 +451,11 @@ contains
     !>Initialize velocity
     !--------------------------------------------------
     subroutine InitVelocity()
-        real(KREAL) :: raw_node(16),raw_weight(16)
+        real(KREAL) :: raw_node(Nu),raw_weight(Nu)
 
-        if (IsS2CN2().or.IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
+        if(len_trim(StructuredVelocityFile)>0)then
+            call InitVelocityFromStructuredFile()
+        elseif (IsS2CN2().or.IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
             ! S2CN2 uses the exact effective GH16 rule frozen by S2D-1-R1.
             ! uSpace/vSpace/weight remain the native authoritative velocity arrays.
             call S2InitVelocity(uSpace,vSpace,weight,raw_node,raw_weight)
@@ -443,6 +477,38 @@ contains
     !--------------------------------------------------
     !>Synchronize primary Nvel velocity arrays from the velocity-space cache.
     !--------------------------------------------------
+    subroutine InitVelocityFromStructuredFile()
+        integer :: iu,ios,n1,n2,k,i,j,l
+        logical :: valid
+        if (myID==0) then
+            open(newunit=iu,file=trim(StructuredVelocityFile),status='old',action='read',iostat=ios)
+            if (ios/=0) call MPI_Abort(MPI_COMM_WORLD,201,ierr)
+            read(iu,*,iostat=ios) n1,n2
+            if (ios/=0) call MPI_Abort(MPI_COMM_WORLD,202,ierr)
+            if(n1/=Nu.or.n2/=Nv) call MPI_Abort(MPI_COMM_WORLD,203,ierr)
+            do k=1,Nvel
+                read(iu,*,iostat=ios) uSpace(k),vSpace(k),weight(k)
+                if (ios/=0) call MPI_Abort(MPI_COMM_WORLD,204,ierr)
+            enddo
+            close(iu)
+        endif
+        call MPI_Bcast(uSpace,Nvel,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(vSpace,Nvel,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(weight,Nvel,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
+        valid=all(ieee_is_finite(uSpace)).and.all(ieee_is_finite(vSpace)) &
+            .and.all(ieee_is_finite(weight)).and.all(weight>0.0_KREAL)
+        do j=1,Nv; do i=1,Nu
+            k=i+(j-1)*Nu
+            valid=valid.and.uSpace(k)==uSpace(i).and.vSpace(k)==vSpace(1+(j-1)*Nu)
+            l=(Nu+1-i)+(Nv-j)*Nu
+            valid=valid.and.uSpace(k)==-uSpace(l).and.vSpace(k)==-vSpace(l).and.weight(k)==weight(l)
+        enddo; enddo
+        if (.not.valid) call MPI_Abort(MPI_COMM_WORLD,205,ierr)
+        U_MIN=minval(uSpace); U_MAX=maxval(uSpace)
+        V_MIN=minval(vSpace); V_MAX=maxval(vSpace)
+    end subroutine InitVelocityFromStructuredFile
+
+
     subroutine FlattenVelocitySpace()
         integer(KINT)                                   :: k
 
@@ -691,7 +757,21 @@ contains
     subroutine InitFlowField()
         !integer(KINT)   :: i,j
         
-        if(IsS2CN2().or.IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
+        if(IsS2CN2())then
+            select case(Iflag_InitFlow)
+            case(Init_Freestream)
+                call InitFlow_Freestream
+            case(Init_Macroflow)
+                call InitFlow_Macroflow
+            case(Init_Restart)
+                if(.not.UnifiedPhysicalOperators)call S2NativeReadMetadata(.true.)
+                call InitFlow_Restart
+            case default
+                error stop 'unsupported native S2 Iflag_InitFlow'
+            end select
+            call S2NativeInitializeState(.true.,Iflag_InitFlow/=Init_Restart)
+            if(Iflag_InitFlow==Init_Restart.and..not.UnifiedPhysicalOperators)call S2NativeReadMetadata(.false.)
+        elseif(IsS2Steady().or.trim(adjustl(PeriodicComparisonProfile))=='BGK_ConstTau') then
             call S2NativeInitializeState()
         elseif(Iflag_DIS==0) then
             select case(Iflag_InitFlow)
@@ -797,7 +877,7 @@ contains
             !check whether the macroflow file exists
             inquire(file="Flow2d.plt",exist=ext1)
             if(.not. ext1) then           ! the file does not exist
-                stop 'Error: Macroflow2d.dat does not exist.'
+                call MPI_Abort(MPI_COMM_WORLD,475,ierr)
             endif
         
             !read main flow

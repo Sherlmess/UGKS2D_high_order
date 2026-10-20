@@ -1,11 +1,17 @@
 module mod_S2D1
+    use mod_S2MPI1Layout
+    use mod_S2PhysicalGas, only: s2_tau
+    use mod_VelocityTables, only: VelocityMode,FillVelocity
     use Precision, only: KINT,KREAL
-    use flow_para, only: Nx_all,Ny_all,Nu,Nv,ck,Pr,BC_Type
-    use control_para, only: dt_global,MAX_ITER,TimeIntegration_method,Nstep_show,S2D1_initial_mode,IsS2Steady
+    use flow_para, only: Nx_all,Ny_all,Nu,Nv,ck,Pr,BC_Type,S2W1_wall_mode, &
+        S2W1_wall_ux,S2W1_wall_theta,FluxWall_type,S2PhysicalGas
+    use control_para, only: dt_global,MAX_ITER,TimeIntegration_method,Nstep_show,S2D1_initial_mode,IsS2Steady,IsHighOrderImplicit
     use mpi_para, only: myID
     use const_para, only: PI,BCconst_periodic
+    use mod_S2MultiscaleWall, only: s2w2_wall_node,s2w2_instantaneous_node
     use mod_S2D1Reconstruction, only: s2d1_face3,s2d1_side3,s2d1_cell9,s2d1_cell_faces9, &
-        FirstLayerPlane,prepare_first_layer_plane,s2d1_cell_faces9_cached
+        FirstLayerPlane,prepare_first_layer_plane,s2d1_cell_faces9_cached,s2d1_cell_faces9_wall, &
+        VelocityTileWorkspace,VT_VELOCITIES,prepare_velocity_tile,reconstruct_velocity_tile_cell
     use mod_CorrectedWF2DClosure, only: moment_2d,discrete_equilibrium_q_2d,dq_2d,projector_2d, &
         ClosureFirstOrderContext,closure_first_prepare,closure_first_copy,closure_first_project, &
         closure_first_direction,closure_first_matches
@@ -16,12 +22,23 @@ module mod_S2D1
     private
     public :: IsS2D1,IsS2CN2,IsS2Steady,RunS2D1
     public :: compute_flux,build_targets,advance_step,init_velocity,write_state,heat,make_mke
+    public :: s2w1_wall_node
+    public :: s2w1_compute_wall_flux
+    public :: s2w1d_instantaneous_flux
+    public :: s2w2r_correct
+    public :: reconstruct_cell_pair ! research-only access to unchanged wall input constructor
+    public :: w2_reconstruction_s,w2_wall_s,w2_wall_calls,w2_closure_s
 
     real(KREAL), parameter :: tau0=0.1_KREAL,pi_d=acos(-1.0_KREAL)
     real(KREAL), parameter :: rho0=1.0_KREAL,u0=0.6_KREAL,v0=0.3_KREAL,t0=1.0_KREAL
     real(KREAL), parameter :: amp=0.01_KREAL,gate=2.0e-12_KREAL
     real(KREAL), parameter :: micro_margin=64.0_KREAL*epsilon(1.0_KREAL)
     real(KREAL), parameter :: gw(3)=[5.0_KREAL/18.0_KREAL,4.0_KREAL/9.0_KREAL,5.0_KREAL/18.0_KREAL]
+
+    real(KREAL),save::w2_reconstruction_s=0.0_KREAL,w2_wall_s=0.0_KREAL
+    real(KREAL),save::w2_closure_s=0.0_KREAL
+    integer,save::w2r_research_calls=0
+    integer,save::w2_wall_calls=0
 
 contains
 
@@ -32,7 +49,7 @@ contains
     end function IsS2D1
 
     logical function IsS2CN2()
-        IsS2CN2=trim(adjustl(TimeIntegration_method))=='S2CN2'
+        IsS2CN2=trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsHighOrderImplicit()
     end function IsS2CN2
 
     integer pure function ip(i,n)
@@ -48,9 +65,10 @@ contains
         call MPI_Abort(MPI_COMM_WORLD,code,ierr)
     end subroutine abort_s2
 
-    subroutine primitive(w,rho,ux,vy,temp,p,ok)
+    ! theta_gas=p/rho=T_native/2; this private interface is not native prim.
+    subroutine primitive(w,rho,ux,vy,theta_gas,p,ok)
         real(KREAL),intent(in)::w(4)
-        real(KREAL),intent(out)::rho,ux,vy,temp,p
+        real(KREAL),intent(out)::rho,ux,vy,theta_gas,p
         logical,intent(out)::ok
         real(KREAL)::eint
         ok=.false.;rho=w(1)
@@ -58,17 +76,17 @@ contains
         ux=w(2)/rho;vy=w(3)/rho
         eint=w(4)-0.5_KREAL*rho*(ux*ux+vy*vy)
         if(eint<=0.0_KREAL)return
-        p=(2.0_KREAL/3.0_KREAL)*eint;temp=p/rho
-        ok=all(ieee_is_finite([rho,ux,vy,temp,p])).and.temp>0.0_KREAL
+        p=(2.0_KREAL/real(ck+2,KREAL))*eint;theta_gas=p/rho
+        ok=all(ieee_is_finite([rho,ux,vy,theta_gas,p])).and.theta_gas>0.0_KREAL
     end subroutine primitive
 
     subroutine heat(w,h,b,u,v,weight,q,ok)
         real(KREAL),intent(in)::w(4),h(:),b(:),u(:),v(:),weight(:)
         real(KREAL),intent(out)::q(2)
         logical,intent(out)::ok
-        real(KREAL)::rho,ux,vy,temp,p,cx,cy,c2
+        real(KREAL)::rho,ux,vy,theta_gas,p,cx,cy,c2
         integer::k
-        call primitive(w,rho,ux,vy,temp,p,ok);q=0.0_KREAL
+        call primitive(w,rho,ux,vy,theta_gas,p,ok);q=0.0_KREAL
         if(.not.ok)return
         do k=1,size(u)
             cx=u(k)-ux;cy=v(k)-vy;c2=cx*cx+cy*cy
@@ -84,7 +102,7 @@ contains
         real(KREAL),intent(out)::kappa(2,2),residual
         logical,intent(out)::ok
         type(ClosureFirstOrderContext)::ctx
-        call closure_first_prepare(ctx,w,1,u,v,weight,ok)
+        call closure_first_prepare(ctx,w,ck,u,v,weight,ok)
         if(.not.ok)return
         call make_mke_prepared(ctx,w,u,v,weight,mh,mb,kxh,kxb,kyh,kyb,eah,eab,kappa,ok,residual)
     end subroutine make_mke
@@ -95,21 +113,21 @@ contains
         real(KREAL),intent(out)::mh(:),mb(:),kxh(:),kxb(:),kyh(:),kyb(:),eah(:),eab(:)
         real(KREAL),intent(out)::kappa(2,2),residual
         logical,intent(out)::ok
-        real(KREAL)::rho,ux,vy,temp,p,cx,cy,c2,lambda,coeff,shapeh,shapeb
+        real(KREAL)::rho,ux,vy,theta_gas,p,cx,cy,c2,lambda,coeff,shapeh,shapeb
         real(KREAL)::rh(size(u)),rb(size(u)),mom(4),q(2),theta(4),jac(4,4),qht(size(u),4),qbt(size(u),4)
         logical::lok,matched
         integer::k
         ok=.false.;residual=0.0_KREAL;kappa=0.0_KREAL
-        call closure_first_matches(ctx,w,1,u,v,weight,matched);if(.not.matched)return
-        call primitive(w,rho,ux,vy,temp,p,lok);if(.not.lok)return
-        call analytic_maxwellian_2d(w,1,u,v,eah,eab,lok);if(.not.lok)return
+        call closure_first_matches(ctx,w,ck,u,v,weight,matched);if(.not.matched)return
+        call primitive(w,rho,ux,vy,theta_gas,p,lok);if(.not.lok)return
+        call analytic_maxwellian_2d(w,ck,u,v,eah,eab,lok);if(.not.lok)return
         call closure_first_copy(ctx,mh,mb,theta,jac,qht,qbt,lok);if(.not.lok)return
-        lambda=0.5_KREAL/temp
+        lambda=0.5_KREAL/theta_gas
         do k=1,size(u)
             cx=u(k)-ux;cy=v(k)-vy;c2=cx*cx+cy*cy
             coeff=0.8_KREAL*(1.0_KREAL-Pr)*lambda*lambda/rho
             shapeh=2.0_KREAL*lambda*c2-4.0_KREAL
-            shapeb=shapeh+2.0_KREAL
+            shapeb=shapeh+2.0_KREAL/real(ck,KREAL)
             rh(k)=coeff*cx*shapeh*mh(k);rb(k)=coeff*cx*shapeb*mb(k)
         end do
         call closure_first_project(ctx,rh,rb,kxh,kxb,lok);if(.not.lok)return
@@ -117,7 +135,7 @@ contains
             cx=u(k)-ux;cy=v(k)-vy;c2=cx*cx+cy*cy
             coeff=0.8_KREAL*(1.0_KREAL-Pr)*lambda*lambda/rho
             shapeh=2.0_KREAL*lambda*c2-4.0_KREAL
-            shapeb=shapeh+2.0_KREAL
+            shapeb=shapeh+2.0_KREAL/real(ck,KREAL)
             rh(k)=coeff*cy*shapeh*mh(k);rb(k)=coeff*cy*shapeb*mb(k)
         end do
         call closure_first_project(ctx,rh,rb,kyh,kyb,lok);if(.not.lok)return
@@ -137,7 +155,7 @@ contains
         real(KREAL),intent(out)::dh(:),db(:),residual
         logical,intent(out)::ok
         type(ClosureFirstOrderContext)::ctx
-        call closure_first_prepare(ctx,w,1,u,v,weight,ok)
+        call closure_first_prepare(ctx,w,ck,u,v,weight,ok)
         if(.not.ok)then;residual=huge(1.0_KREAL);return;endif
         call m_direction_prepared(ctx,w,dw,u,v,weight,dh,db,ok,residual)
     end subroutine m_direction
@@ -149,7 +167,7 @@ contains
         logical,intent(out)::ok
         real(KREAL)::mom(4)
         logical::lok,matched
-        call closure_first_matches(ctx,w,1,u,v,weight,matched)
+        call closure_first_matches(ctx,w,ck,u,v,weight,matched)
         if(.not.matched)then;ok=.false.;residual=huge(1.0_KREAL);return;endif
         call closure_first_direction(ctx,dw,dh,db,lok)
         if(.not.lok)then;ok=.false.;residual=huge(1.0_KREAL);return;endif
@@ -178,11 +196,11 @@ contains
         real(KREAL),intent(in)::w(4),q(2),u(:),v(:)
         real(KREAL),intent(out)::sh(:),sb(:),mh(:),mb(:)
         logical,intent(out)::ok
-        real(KREAL)::rho,ux,vy,temp,p,cx,cy,c2,lambda,coeff,qdot
+        real(KREAL)::rho,ux,vy,theta_gas,p,cx,cy,c2,lambda,coeff,qdot
         integer::k
-        call primitive(w,rho,ux,vy,temp,p,ok);if(.not.ok)return
-        call analytic_maxwellian_2d(w,1,u,v,mh,mb,ok);if(.not.ok)return
-        lambda=0.5_KREAL/temp
+        call primitive(w,rho,ux,vy,theta_gas,p,ok);if(.not.ok)return
+        call analytic_maxwellian_2d(w,ck,u,v,mh,mb,ok);if(.not.ok)return
+        lambda=0.5_KREAL/theta_gas
         coeff=0.8_KREAL*(1.0_KREAL-Pr)*lambda*lambda/rho
         do k=1,size(u)
             cx=u(k)-ux;cy=v(k)-vy;c2=cx*cx+cy*cy;qdot=cx*q(1)+cy*q(2)
@@ -275,12 +293,33 @@ contains
         hm=hfield(i,j);bm=bfield(i,j);theta=1.0_KREAL;was_signed=.false.;ok=.false.
         if(present(cacheh).neqv.present(cacheb))return
         if(present(cacheh))then
-            call s2d1_cell_faces9_cached(cacheh,i,j,hface,hnd,htd,hvol,lok);if(.not.lok)return
-            call s2d1_cell_faces9_cached(cacheb,i,j,bface,bnd,btd,bvol,lok);if(.not.lok)return
+            if(S2W1_wall_mode==1)then
+                call s2d1_cell_faces9_cached(cacheh,i,j,hface,hnd,htd,hvol,lok,hfield,.true.);if(.not.lok)return
+                call s2d1_cell_faces9_cached(cacheb,i,j,bface,bnd,btd,bvol,lok,bfield,.true.);if(.not.lok)return
+            else
+                call s2d1_cell_faces9_cached(cacheh,i,j,hface,hnd,htd,hvol,lok);if(.not.lok)return
+                call s2d1_cell_faces9_cached(cacheb,i,j,bface,bnd,btd,bvol,lok);if(.not.lok)return
+            endif
         else
-            call s2d1_cell_faces9(hfield,i,j,hface,hnd,htd,hvol,lok);if(.not.lok)return
-            call s2d1_cell_faces9(bfield,i,j,bface,bnd,btd,bvol,lok);if(.not.lok)return
+            if(S2W1_wall_mode==1)then
+                call s2d1_cell_faces9_wall(hfield,i,j,hface,hnd,htd,hvol,lok);if(.not.lok)return
+                call s2d1_cell_faces9_wall(bfield,i,j,bface,bnd,btd,bvol,lok);if(.not.lok)return
+            else
+                call s2d1_cell_faces9(hfield,i,j,hface,hnd,htd,hvol,lok);if(.not.lok)return
+                call s2d1_cell_faces9(bfield,i,j,bface,bnd,btd,bvol,lok);if(.not.lok)return
+            endif
         endif
+        call limit_cell_outputs(hm,bm,dx,dy,hface,bface,hnd,htd,bnd,btd,hvol,bvol,theta,was_signed,ok)
+    end subroutine reconstruct_cell_pair
+
+    subroutine limit_cell_outputs(hm,bm,dx,dy,hface,bface,hnd,htd,bnd,btd,hvol,bvol,theta,was_signed,ok)
+        real(KREAL),intent(in)::hm,bm,dx,dy,hvol(3,3),bvol(3,3)
+        real(KREAL),intent(inout)::hface(4,3),bface(4,3),hnd(4,3),htd(4,3),bnd(4,3),btd(4,3)
+        real(KREAL),intent(out)::theta
+        logical,intent(out)::was_signed,ok
+        real(KREAL)::den
+        integer::s,a,c
+        theta=1.0_KREAL;was_signed=.false.;ok=.false.
         if(hm<=0.0_KREAL.or.bm<=0.0_KREAL)then
             theta=0.0_KREAL;was_signed=.true.
         else
@@ -303,7 +342,8 @@ contains
         ok=all(ieee_is_finite(hface)).and.all(ieee_is_finite(bface)).and. &
             all(ieee_is_finite(hnd)).and.all(ieee_is_finite(htd)).and. &
             all(ieee_is_finite(bnd)).and.all(ieee_is_finite(btd)).and.ieee_is_finite(theta)
-    end subroutine reconstruct_cell_pair
+    end subroutine
+
 
     subroutine reconstruct_face(h,b,axis,face,tangent,dx,dy,hl,hr,bl,br,hnl,hnr,htl,htr, &
         bnl,bnr,btl,btr,limited,signed,ok)
@@ -379,20 +419,21 @@ contains
     end subroutine reconstruct_face
 
     subroutine ugks_node(axis,dt,hl,hr,bl,br,hnl,hnr,htl,htr,bnl,bnr,btl,btr, &
-        macro_nl,macro_nr,macro_t,u,v,weight,fh,fb,fw,face_moment_error,ok)
+        macro_nl,macro_nr,macro_t,u,v,weight,fh,fb,fw,face_moment_error,ok,f0_h,f0_b,k_h,k_b)
         integer,intent(in)::axis
         real(KREAL),intent(in)::dt,hl(:),hr(:),bl(:),br(:),hnl(:),hnr(:),htl(:),htr(:)
         real(KREAL),intent(in)::bnl(:),bnr(:),btl(:),btr(:),u(:),v(:),weight(:)
         real(KREAL),intent(in)::macro_nl(4),macro_nr(4),macro_t(4)
         real(KREAL),intent(out)::fh(:),fb(:),fw(4),face_moment_error
         logical,intent(out)::ok
+        real(KREAL),intent(out),optional::f0_h(:),f0_b(:),k_h(:),k_b(:)
         real(KREAL)::f0h(size(u)),f0b(size(u)),fnh(size(u)),fnb(size(u)),fth(size(u)),ftb(size(u))
         real(KREAL)::w0(4),q0(2),wtime(4),kap(2,2),closure_res,dres
         real(KREAL)::mh(size(u)),mb(size(u)),kxh(size(u)),kxb(size(u)),kyh(size(u)),kyb(size(u))
         real(KREAL)::eah(size(u)),eab(size(u)),s0h(size(u)),s0b(size(u))
         real(KREAL)::mnlh(size(u)),mnlb(size(u)),mnrh(size(u)),mnrb(size(u))
         real(KREAL)::mth(size(u)),mtb(size(u)),mtimeh(size(u)),mtimeb(size(u)),vn,vt
-        real(KREAL)::mt(5),slopeh,slopeb,mom(4),ex
+        real(KREAL)::mt(5),slopeh,slopeb,mom(4),ex,tau_face
         logical::lok
         integer::k
         type(ClosureFirstOrderContext)::closure
@@ -407,7 +448,7 @@ contains
             endif
         end do
         call moment_2d(f0h,f0b,u,v,weight,w0,lok);if(.not.lok)then;ok=.false.;return;endif
-        call closure_first_prepare(closure,w0,1,u,v,weight,lok);if(.not.lok)then;ok=.false.;return;endif
+        call closure_first_prepare(closure,w0,ck,u,v,weight,lok);if(.not.lok)then;ok=.false.;return;endif
         call make_mke_prepared(closure,w0,u,v,weight,mh,mb,kxh,kxb,kyh,kyb,eah,eab,kap,lok,closure_res)
         if(.not.lok)then;ok=.false.;return;endif
         call heat(w0,f0h-eah,f0b-eab,u,v,weight,q0,lok);if(.not.lok)then;ok=.false.;return;endif
@@ -431,9 +472,17 @@ contains
         call moment_2d(fnh,fnb,u,v,weight,wtime,lok);if(.not.lok)then;ok=.false.;return;endif
         wtime=-wtime
         call m_direction_prepared(closure,w0,wtime,u,v,weight,mtimeh,mtimeb,lok,dres);if(.not.lok)then;ok=.false.;return;endif
+        if(S2PhysicalGas==1)then
+        tau_face=s2_tau(w0,2)
+        ex=exp(-dt/tau_face);mt(4)=tau_face*(1.0_KREAL-ex)
+        mt(5)=-tau_face*dt*ex+tau_face*mt(4);mt(1)=dt-mt(4)
+        mt(2)=-tau_face*mt(1)+mt(5);mt(3)=0.5_KREAL*dt*dt-tau_face*mt(1)
+        else
+            tau_face=tau0
         ex=exp(-dt/tau0);mt(4)=tau0*(1.0_KREAL-ex)
         mt(5)=-tau0*dt*ex+tau0*mt(4);mt(1)=dt-mt(4)
         mt(2)=-tau0*mt(1)+mt(5);mt(3)=0.5_KREAL*dt*dt-tau0*mt(1)
+        endif
         do k=1,size(u)
             vn=merge(u(k),v(k),axis==1);vt=merge(v(k),u(k),axis==1)
             if(vn>=0.0_KREAL)then
@@ -445,6 +494,11 @@ contains
                 -mt(5)*(vn*fnh_from(k,hnl,hnr,u,v,axis)+vt*fth(k)))
             fb(k)=vn*(mt(1)*s0b(k)+mt(2)*slopeb+mt(3)*mtimeb(k)+mt(4)*f0b(k) &
                 -mt(5)*(vn*fnb_from(k,bnl,bnr,u,v,axis)+vt*ftb(k)))
+            if(present(f0_h))then
+                f0_h(k)=vn*f0h(k);f0_b(k)=vn*f0b(k)
+                k_h(k)=vn*((s0h(k)-f0h(k))/tau_face-vn*fnh_from(k,hnl,hnr,u,v,axis)-vt*fth(k))
+                k_b(k)=vn*((s0b(k)-f0b(k))/tau_face-vn*fnb_from(k,bnl,bnr,u,v,axis)-vt*ftb(k))
+            endif
         end do
         call moment_2d(fh,fb,u,v,weight,fw,lok)
         if(.not.lok)then;ok=.false.;return;endif
@@ -576,12 +630,17 @@ contains
     end subroutine ugks_node_vl
 
     subroutine compute_flux(w,h,b,u,v,weight,dx,dy,dt,fxw,fyw,fxh,fxb,fyh,fyb, &
-        face_error,limited,signed,ok)
+        face_error,limited,signed,ok,lower_w,lower_h,lower_b, &
+        leading_xh,leading_xb,leading_yh,leading_yb,time_xh,time_xb,time_yh,time_yb,lower0h,lower0b,lowerKh,lowerKb)
         real(KREAL),intent(in)::w(:,:,:),h(:,:,:),b(:,:,:),u(:),v(:),weight(:),dx,dy,dt
         real(KREAL),intent(out)::fxw(:,:,:),fyw(:,:,:),fxh(:,:,:),fxb(:,:,:),fyh(:,:,:),fyb(:,:,:)
         real(KREAL),intent(out)::face_error
         integer,intent(out)::limited,signed
         logical,intent(out)::ok
+        real(KREAL),intent(out),optional::lower_w(:,:),lower_h(:,:),lower_b(:,:)
+        real(KREAL),intent(out),optional::leading_xh(:,:,:),leading_xb(:,:,:),leading_yh(:,:,:),leading_yb(:,:,:)
+        real(KREAL),intent(out),optional::time_xh(:,:,:),time_xb(:,:,:),time_yh(:,:,:),time_yb(:,:,:)
+        real(KREAL),intent(out),optional::lower0h(:,:),lower0b(:,:),lowerKh(:,:),lowerKb(:,:)
         integer::nx,ny,nvel,i,j,a,m
         real(KREAL)::hl(size(u),3),hr(size(u),3),bl(size(u),3),br(size(u),3)
         real(KREAL)::hnl(size(u),3),hnr(size(u),3),htl(size(u),3),htr(size(u),3)
@@ -592,49 +651,167 @@ contains
         real(KREAL),allocatable::ch(:,:,:,:,:),cb(:,:,:,:,:),chnd(:,:,:,:,:),chtd(:,:,:,:,:)
         real(KREAL),allocatable::cbnd(:,:,:,:,:),cbtd(:,:,:,:,:)
         real(KREAL)::thf(4,3),tbf(4,3),thn(4,3),tht(4,3),tbn(4,3),tbt(4,3)
-        logical::lok,was_signed,is_s2
-        integer::k
+        real(KREAL)::nf0h(size(u)),nf0b(size(u)),nkh(size(u)),nkb(size(u))
+        real(KREAL)::w2_start,w2_end
+        logical::lok,was_signed,is_s2,want_coeff,want_wallcoeff
+        integer::k,il,ih,jl,jh
+        integer,allocatable::owner_counts(:,:,:)
+        logical::use_owner,recon_ok,use_scope,use_tile,profile_tile
+        type(VelocityTileWorkspace)::tile
+        integer::k0,nt,kv,fhidx,fbidx,tile_unit
+        real(KREAL)::tile_t0,tile_t1,tile_prepare_s,tile_store_s
+        character(len=80)::tile_filename
+        logical::tile_exists
+        character(len=16)::scope_setting
+        integer::scope_status
+        real(KREAL)::owner_start
         type(FirstLayerPlane)::cacheh,cacheb
         nx=size(h,1);ny=size(h,2);nvel=size(h,3)
+        want_coeff=present(leading_xh);want_wallcoeff=present(lower0h)
+        if(want_wallcoeff)then
+            if(.not.(want_coeff.and.present(lower0b).and.present(lowerKh).and.present(lowerKb)))then
+                ok=.false.;return
+            endif
+            lower0h=0;lower0b=0;lowerKh=0;lowerKb=0
+        endif
+        if(want_coeff)then
+            if(.not.(present(leading_xb).and.present(leading_yh).and.present(leading_yb).and. &
+                present(time_xh).and.present(time_xb).and.present(time_yh).and.present(time_yb)))then
+                ok=.false.;return
+            endif
+            leading_xh=0.0_KREAL;leading_xb=0.0_KREAL;leading_yh=0.0_KREAL;leading_yb=0.0_KREAL
+            time_xh=0.0_KREAL;time_xb=0.0_KREAL;time_yh=0.0_KREAL;time_yb=0.0_KREAL
+        endif
         ! This selects the spatial S2 reconstruction only.  IsS2CN2 retains
         ! its separate meaning for the physical-time CN update dispatcher.
         is_s2=trim(adjustl(TimeIntegration_method))=='S2D1'.or.IsS2CN2().or.IsS2Steady()
         fxw=0.0_KREAL;fyw=0.0_KREAL;fxh=0.0_KREAL;fxb=0.0_KREAL
         fyh=0.0_KREAL;fyb=0.0_KREAL;face_error=0.0_KREAL;limited=0;signed=0
+        w2_reconstruction_s=0.0_KREAL;w2_wall_s=0.0_KREAL;w2_wall_calls=0
+        call cpu_time(w2_start)
+        ! Local cache order: side,node,velocity,x,y. Arithmetic and traversal unchanged.
         if(is_s2)then
-            allocate(ch(nx,ny,nvel,4,3),cb(nx,ny,nvel,4,3),chnd(nx,ny,nvel,4,3), &
-                chtd(nx,ny,nvel,4,3),cbnd(nx,ny,nvel,4,3),cbtd(nx,ny,nvel,4,3))
-            do k=1,nvel
-                call prepare_first_layer_plane(cacheh,h(:,:,k),lok)
-                if(.not.lok)then;ok=.false.;return;endif
-                call prepare_first_layer_plane(cacheb,b(:,:,k),lok)
-                if(.not.lok)then;ok=.false.;return;endif
-            do j=1,ny;do i=1,nx
+            allocate(ch(4,3,nvel,nx,ny),cb(4,3,nvel,nx,ny),chnd(4,3,nvel,nx,ny), &
+                chtd(4,3,nvel,nx,ny),cbnd(4,3,nvel,nx,ny),cbtd(4,3,nvel,nx,ny))
+            il=xrecon_lo();ih=xrecon_hi(nx);jl=yrecon_lo();jh=recon_hi(ny)
+            use_owner=.false.
+            use_owner=owner_enabled()
+            if(use_owner)then
+                il=xlo();ih=xhi(nx);jl=active_lo();jh=active_hi(ny)
+                allocate(owner_counts(2,nx,ny));owner_counts=0
+            endif
+            scope_setting='';call get_environment_variable('S2_FIRST_LAYER_SCOPE',scope_setting,status=scope_status)
+            use_scope=use_owner.and.scope_status==0.and.trim(scope_setting)=='1'
+            scope_setting='';call get_environment_variable('S2_VELOCITY_TILE',scope_setting,status=scope_status)
+            use_tile=use_scope.and.scope_status==0.and.trim(scope_setting)=='1'
+            scope_setting='';call get_environment_variable('S2_TILE_PROFILE',scope_setting,status=scope_status)
+            profile_tile=scope_status==0.and.trim(scope_setting)=='1'
+            tile%profile=profile_tile;tile_prepare_s=0;tile_store_s=0
+            scope_setting='';call get_environment_variable('S2_WALL_TILE',scope_setting,status=scope_status)
+            tile%wall_batch=use_tile.and.scope_status==0.and.trim(scope_setting)=='1'
+            recon_ok=.true.;owner_start=MPI_Wtime()
+            if(use_tile)then
+                velocity_tiles:do k0=1,nvel,VT_VELOCITIES
+                    nt=min(VT_VELOCITIES,nvel-k0+1)
+                    if(profile_tile)call cpu_time(tile_t0)
+                    call prepare_velocity_tile(tile,h,b,k0,nt,[il,ih,jl,jh],S2W1_wall_mode==1,lok)
+                    if(.not.lok)then;recon_ok=.false.;exit velocity_tiles;endif
+                    if(profile_tile)then
+                        call cpu_time(tile_t1);tile_prepare_s=tile_prepare_s+tile_t1-tile_t0
+                    endif
+                    do j=jl,jh;do i=il,ih
+                        call reconstruct_velocity_tile_cell(tile,h,b,k0,i,j,S2W1_wall_mode==1,lok)
+                        if(.not.lok)then;recon_ok=.false.;exit velocity_tiles;endif
+                        if(profile_tile)call cpu_time(tile_t0)
+                        do kv=1,nt
+                            k=k0+kv-1;fhidx=2*kv-1;fbidx=2*kv
+                            call limit_cell_outputs(h(i,j,k),b(i,j,k),dx,dy, &
+                                tile%face(:,:,fhidx),tile%face(:,:,fbidx),tile%dn(:,:,fhidx), &
+                                tile%dt(:,:,fhidx),tile%dn(:,:,fbidx),tile%dt(:,:,fbidx), &
+                                tile%vol(:,:,fhidx),tile%vol(:,:,fbidx),theta,was_signed,lok)
+                            if(.not.lok)then;recon_ok=.false.;exit velocity_tiles;endif
+                            ch(:,:,k,i,j)=tile%face(:,:,fhidx);cb(:,:,k,i,j)=tile%face(:,:,fbidx)
+                            chnd(:,:,k,i,j)=tile%dn(:,:,fhidx);chtd(:,:,k,i,j)=tile%dt(:,:,fhidx)
+                            cbnd(:,:,k,i,j)=tile%dn(:,:,fbidx);cbtd(:,:,k,i,j)=tile%dt(:,:,fbidx)
+                            owner_cells=owner_cells+1
+                            if(was_signed)owner_counts(2,i,j)=owner_counts(2,i,j)+1
+                            if((.not.was_signed).and.theta<1.0_KREAL)owner_counts(1,i,j)=owner_counts(1,i,j)+1
+                            if(was_signed)signed=signed+1
+                            if((.not.was_signed).and.theta<1.0_KREAL)limited=limited+1
+                        enddo
+                        if(profile_tile)then
+                            call cpu_time(tile_t1);tile_store_s=tile_store_s+tile_t1-tile_t0
+                        endif
+                    enddo;enddo
+                enddo velocity_tiles
+            else
+            recon_vel: do k=1,nvel
+                if(use_scope)then
+                    call prepare_first_layer_plane(cacheh,h(:,:,k),lok,S2W1_wall_mode==1,[il,ih,jl,jh])
+                else
+                    call prepare_first_layer_plane(cacheh,h(:,:,k),lok,S2W1_wall_mode==1)
+                endif
+                if(.not.lok)then;recon_ok=.false.;exit recon_vel;endif
+                if(use_scope)then
+                    call prepare_first_layer_plane(cacheb,b(:,:,k),lok,S2W1_wall_mode==1,[il,ih,jl,jh])
+                else
+                    call prepare_first_layer_plane(cacheb,b(:,:,k),lok,S2W1_wall_mode==1)
+                endif
+                if(.not.lok)then;recon_ok=.false.;exit recon_vel;endif
+            do j=jl,jh;do i=il,ih
                 call reconstruct_cell_pair(h(:,:,k),b(:,:,k),i,j,dx,dy,thf,tbf,thn,tht,tbn,tbt, &
                     theta,was_signed,lok,cacheh,cacheb)
-                if(.not.lok)then;ok=.false.;return;endif
-                ch(i,j,k,:,:)=thf;cb(i,j,k,:,:)=tbf;chnd(i,j,k,:,:)=thn;chtd(i,j,k,:,:)=tht
-                cbnd(i,j,k,:,:)=tbn;cbtd(i,j,k,:,:)=tbt
+                if(.not.lok)then;recon_ok=.false.;exit recon_vel;endif
+                ch(:,:,k,i,j)=thf;cb(:,:,k,i,j)=tbf;chnd(:,:,k,i,j)=thn;chtd(:,:,k,i,j)=tht
+                cbnd(:,:,k,i,j)=tbn;cbtd(:,:,k,i,j)=tbt
+                owner_cells=owner_cells+1
+                if(use_owner)then
+                    if(was_signed)owner_counts(2,i,j)=owner_counts(2,i,j)+1
+                    if((.not.was_signed).and.theta<1.0_KREAL)owner_counts(1,i,j)=owner_counts(1,i,j)+1
+                endif
                 if(was_signed)signed=signed+1
                 if((.not.was_signed).and.theta<1.0_KREAL)limited=limited+1
             enddo;enddo
-            enddo
+            enddo recon_vel
+            endif
+            if(use_tile.and.profile_tile)then
+                write(tile_filename,'("velocity_tile_rank",I4.4,".csv")')myID
+                inquire(file=trim(tile_filename),exist=tile_exists)
+                open(newunit=tile_unit,file=trim(tile_filename),status='unknown',position='append')
+                if(.not.tile_exists)write(tile_unit,'(A)') &
+                    'prepare_s,pack_s,kernel_s,unpack_s,limit_store_s,wall_fallback_s,packed_values,stored_values,cells,fallback_cells'
+                write(tile_unit,'(6(ES24.16,","),3(I0,","),I0)') &
+                    tile_prepare_s,tile%pack_s,tile%kernel_s,tile%unpack_s,tile_store_s,tile%fallback_s, &
+                    tile%packed_values,tile%stored_values,tile%cells,tile%fallback_cells
+                close(tile_unit)
+            endif
+            owner_reconstruction_s=owner_reconstruction_s+MPI_Wtime()-owner_start
+            if(use_owner)then
+                call owner_ready(recon_ok)
+                if(.not.recon_ok)then;ok=.false.;return;endif
+                call owner_exchange(ch,cb,chnd,chtd,cbnd,cbtd,owner_counts)
+                limited=sum(owner_counts(1,xrecon_lo():xrecon_hi(nx),yrecon_lo():recon_hi(ny)))
+                signed=sum(owner_counts(2,xrecon_lo():xrecon_hi(nx),yrecon_lo():recon_hi(ny)))
+            endif
+            if(.not.recon_ok)then;ok=.false.;return;endif
         endif
-        do j=1,ny
-            do i=1,nx
+        call cpu_time(w2_end);w2_reconstruction_s=w2_end-w2_start
+        call cpu_time(w2_start)
+        do j=yrecon_lo(),active_hi(ny)
+            do i=xrecon_lo(),xhi(nx)
                 if(is_s2)then
                     do m=1,4
-                        call s2d1_face3(w(m,:,:),1,i,j,ml,mr,mnl,mnr,mtl,mtr,lok)
+                        call s2d1_face3(w(m,:,:),1,i,j,ml,mr,mnl,mnr,mtl,mtr,lok,S2W1_wall_mode==1)
                         if(.not.lok)then;ok=.false.;return;endif
                         macro_nl(m,:)=mnl/dx;macro_nr(m,:)=mnr/dx
                         macro_t(m,:)=0.5_KREAL*(mtl+mtr)/dy
                     enddo
-                    hl=ch(i,j,:,2,:);hr=ch(ip(i+1,nx),j,:,1,:)
-                    bl=cb(i,j,:,2,:);br=cb(ip(i+1,nx),j,:,1,:)
-                    hnl=chnd(i,j,:,2,:);hnr=chnd(ip(i+1,nx),j,:,1,:)
-                    htl=chtd(i,j,:,2,:);htr=chtd(ip(i+1,nx),j,:,1,:)
-                    bnl=cbnd(i,j,:,2,:);bnr=cbnd(ip(i+1,nx),j,:,1,:)
-                    btl=cbtd(i,j,:,2,:);btr=cbtd(ip(i+1,nx),j,:,1,:)
+                    hl=transpose(ch(2,:,:,i,j));hr=transpose(ch(1,:,:,ip(i+1,nx),j))
+                    bl=transpose(cb(2,:,:,i,j));br=transpose(cb(1,:,:,ip(i+1,nx),j))
+                    hnl=transpose(chnd(2,:,:,i,j));hnr=transpose(chnd(1,:,:,ip(i+1,nx),j))
+                    htl=transpose(chtd(2,:,:,i,j));htr=transpose(chtd(1,:,:,ip(i+1,nx),j))
+                    bnl=transpose(cbnd(2,:,:,i,j));bnr=transpose(cbnd(1,:,:,ip(i+1,nx),j))
+                    btl=transpose(cbtd(2,:,:,i,j));btr=transpose(cbtd(1,:,:,ip(i+1,nx),j))
                 else
                     call reconstruct_face(h,b,1,i,j,dx,dy,hl,hr,bl,br,hnl,hnr,htl,htr, &
                         bnl,bnr,btl,btr,limited,signed,lok)
@@ -648,27 +825,39 @@ contains
                     fxh(i,j,:)=fh;fxb(i,j,:)=fb;fxw(:,i,j)=fw;face_error=max(face_error,err)
                 else
                     do a=1,3
+                        if(want_coeff)then
+                            call ugks_node(1,dt,hl(:,a),hr(:,a),bl(:,a),br(:,a),hnl(:,a),hnr(:,a), &
+                                htl(:,a),htr(:,a),bnl(:,a),bnr(:,a),btl(:,a),btr(:,a), &
+                                macro_nl(:,a),macro_nr(:,a),macro_t(:,a),u,v,weight,fh,fb,fw,err,lok, &
+                                nf0h,nf0b,nkh,nkb)
+                            leading_xh(i,j,:)=leading_xh(i,j,:)+gw(a)*nf0h
+                            leading_xb(i,j,:)=leading_xb(i,j,:)+gw(a)*nf0b
+                            time_xh(i,j,:)=time_xh(i,j,:)+gw(a)*nkh
+                            time_xb(i,j,:)=time_xb(i,j,:)+gw(a)*nkb
+                        else
                         call ugks_node(1,dt,hl(:,a),hr(:,a),bl(:,a),br(:,a),hnl(:,a),hnr(:,a), &
                             htl(:,a),htr(:,a),bnl(:,a),bnr(:,a),btl(:,a),btr(:,a), &
                             macro_nl(:,a),macro_nr(:,a),macro_t(:,a),u,v,weight,fh,fb,fw,err,lok)
+                        endif
                         if(.not.lok)then;ok=.false.;return;endif
                         fxh(i,j,:)=fxh(i,j,:)+gw(a)*fh;fxb(i,j,:)=fxb(i,j,:)+gw(a)*fb
                         fxw(:,i,j)=fxw(:,i,j)+gw(a)*fw;face_error=max(face_error,err)
                     enddo
                 endif
+                if(S2W1_wall_mode==1.and.global_j(j)==global_ny(ny))cycle
                 if(is_s2)then
                     do m=1,4
-                        call s2d1_face3(w(m,:,:),2,j,i,ml,mr,mnl,mnr,mtl,mtr,lok)
+                        call s2d1_face3(w(m,:,:),2,j,i,ml,mr,mnl,mnr,mtl,mtr,lok,S2W1_wall_mode==1)
                         if(.not.lok)then;ok=.false.;return;endif
                         macro_nl(m,:)=mnl/dy;macro_nr(m,:)=mnr/dy
                         macro_t(m,:)=0.5_KREAL*(mtl+mtr)/dx
                     enddo
-                    hl=ch(i,j,:,4,:);hr=ch(i,ip(j+1,ny),:,3,:)
-                    bl=cb(i,j,:,4,:);br=cb(i,ip(j+1,ny),:,3,:)
-                    hnl=chnd(i,j,:,4,:);hnr=chnd(i,ip(j+1,ny),:,3,:)
-                    htl=chtd(i,j,:,4,:);htr=chtd(i,ip(j+1,ny),:,3,:)
-                    bnl=cbnd(i,j,:,4,:);bnr=cbnd(i,ip(j+1,ny),:,3,:)
-                    btl=cbtd(i,j,:,4,:);btr=cbtd(i,ip(j+1,ny),:,3,:)
+                    hl=transpose(ch(4,:,:,i,j));hr=transpose(ch(3,:,:,i,ip(j+1,ny)))
+                    bl=transpose(cb(4,:,:,i,j));br=transpose(cb(3,:,:,i,ip(j+1,ny)))
+                    hnl=transpose(chnd(4,:,:,i,j));hnr=transpose(chnd(3,:,:,i,ip(j+1,ny)))
+                    htl=transpose(chtd(4,:,:,i,j));htr=transpose(chtd(3,:,:,i,ip(j+1,ny)))
+                    bnl=transpose(cbnd(4,:,:,i,j));bnr=transpose(cbnd(3,:,:,i,ip(j+1,ny)))
+                    btl=transpose(cbtd(4,:,:,i,j));btr=transpose(cbtd(3,:,:,i,ip(j+1,ny)))
                 else
                     call reconstruct_face(h,b,2,j,i,dx,dy,hl,hr,bl,br,hnl,hnr,htl,htr, &
                         bnl,bnr,btl,btr,limited,signed,lok)
@@ -682,9 +871,20 @@ contains
                     fyh(i,j,:)=fh;fyb(i,j,:)=fb;fyw(:,i,j)=fw;face_error=max(face_error,err)
                 else
                     do a=1,3
+                        if(want_coeff)then
+                            call ugks_node(2,dt,hl(:,a),hr(:,a),bl(:,a),br(:,a),hnl(:,a),hnr(:,a), &
+                                htl(:,a),htr(:,a),bnl(:,a),bnr(:,a),btl(:,a),btr(:,a), &
+                                macro_nl(:,a),macro_nr(:,a),macro_t(:,a),u,v,weight,fh,fb,fw,err,lok, &
+                                nf0h,nf0b,nkh,nkb)
+                            leading_yh(i,j,:)=leading_yh(i,j,:)+gw(a)*nf0h
+                            leading_yb(i,j,:)=leading_yb(i,j,:)+gw(a)*nf0b
+                            time_yh(i,j,:)=time_yh(i,j,:)+gw(a)*nkh
+                            time_yb(i,j,:)=time_yb(i,j,:)+gw(a)*nkb
+                        else
                         call ugks_node(2,dt,hl(:,a),hr(:,a),bl(:,a),br(:,a),hnl(:,a),hnr(:,a), &
                             htl(:,a),htr(:,a),bnl(:,a),bnr(:,a),btl(:,a),btr(:,a), &
                             macro_nl(:,a),macro_nr(:,a),macro_t(:,a),u,v,weight,fh,fb,fw,err,lok)
+                        endif
                         if(.not.lok)then;ok=.false.;return;endif
                         fyh(i,j,:)=fyh(i,j,:)+gw(a)*fh;fyb(i,j,:)=fyb(i,j,:)+gw(a)*fb
                         fyw(:,i,j)=fyw(:,i,j)+gw(a)*fw;face_error=max(face_error,err)
@@ -692,8 +892,356 @@ contains
                 endif
             enddo
         enddo
+        call cpu_time(w2_end);w2_closure_s=w2_end-w2_start
+        if(S2W1_wall_mode==1)then
+            if(.not.(present(lower_w).and.present(lower_h).and.present(lower_b)))then
+                ok=.false.;return
+            endif
+            lower_w=0.0_KREAL;lower_h=0.0_KREAL;lower_b=0.0_KREAL
+            call cpu_time(w2_start)
+            do i=xlo(),xhi(nx)
+                do a=1,3
+                    if(lower_wall())then
+                    if(FluxWall_type==1)then
+                        if(want_wallcoeff)then
+                        call s2w2_wall_node(-1,dt,dy,w(:,i,active_lo()),ch(3,a,:,i,active_lo()),cb(3,a,:,i,active_lo()), &
+                            chnd(3,a,:,i,active_lo()),cbnd(3,a,:,i,active_lo()),chtd(3,a,:,i,active_lo()),cbtd(3,a,:,i,active_lo()), &
+                            u,v,weight,S2W1_wall_ux(1),S2W1_wall_theta(1),fh,fb,fw,lok, &
+                            f0_h=nf0h,f0_b=nf0b,k_h=nkh,k_b=nkb)
+                            lower0h(i,:)=lower0h(i,:)+gw(a)*nf0h
+                            lower0b(i,:)=lower0b(i,:)+gw(a)*nf0b
+                            lowerKh(i,:)=lowerKh(i,:)+gw(a)*nkh
+                            lowerKb(i,:)=lowerKb(i,:)+gw(a)*nkb
+                        else
+                        call s2w2_wall_node(-1,dt,dy,w(:,i,active_lo()),ch(3,a,:,i,active_lo()),cb(3,a,:,i,active_lo()), &
+                            chnd(3,a,:,i,active_lo()),cbnd(3,a,:,i,active_lo()),chtd(3,a,:,i,active_lo()),cbtd(3,a,:,i,active_lo()), &
+                            u,v,weight,S2W1_wall_ux(1),S2W1_wall_theta(1),fh,fb,fw,lok)
+                        endif
+                    else
+                    call s2w1_wall_node(-1,dt,ch(3,a,:,i,active_lo()),cb(3,a,:,i,active_lo()),u,v,weight, &
+                        S2W1_wall_ux(1),S2W1_wall_theta(1),fh,fb,fw,lok)
+                    endif
+                    if(.not.lok)then;ok=.false.;return;endif
+                    lower_h(i,:)=lower_h(i,:)+gw(a)*fh
+                    lower_b(i,:)=lower_b(i,:)+gw(a)*fb
+                    lower_w(:,i)=lower_w(:,i)+gw(a)*fw
+                    endif
+                    if(upper_wall())then
+                    if(FluxWall_type==1)then
+                        if(want_wallcoeff)then
+                        call s2w2_wall_node(1,dt,dy,w(:,i,active_hi(ny)),ch(4,a,:,i,active_hi(ny)),cb(4,a,:,i,active_hi(ny)), &
+                            chnd(4,a,:,i,active_hi(ny)),cbnd(4,a,:,i,active_hi(ny)),chtd(4,a,:,i,active_hi(ny)),cbtd(4,a,:,i,active_hi(ny)), &
+                            u,v,weight,S2W1_wall_ux(2),S2W1_wall_theta(2),fh,fb,fw,lok, &
+                            f0_h=nf0h,f0_b=nf0b,k_h=nkh,k_b=nkb)
+                            leading_yh(i,active_hi(ny),:)=leading_yh(i,active_hi(ny),:)+gw(a)*nf0h
+                            leading_yb(i,active_hi(ny),:)=leading_yb(i,active_hi(ny),:)+gw(a)*nf0b
+                            time_yh(i,active_hi(ny),:)=time_yh(i,active_hi(ny),:)+gw(a)*nkh
+                            time_yb(i,active_hi(ny),:)=time_yb(i,active_hi(ny),:)+gw(a)*nkb
+                        else
+                        call s2w2_wall_node(1,dt,dy,w(:,i,active_hi(ny)),ch(4,a,:,i,active_hi(ny)),cb(4,a,:,i,active_hi(ny)), &
+                            chnd(4,a,:,i,active_hi(ny)),cbnd(4,a,:,i,active_hi(ny)),chtd(4,a,:,i,active_hi(ny)),cbtd(4,a,:,i,active_hi(ny)), &
+                            u,v,weight,S2W1_wall_ux(2),S2W1_wall_theta(2),fh,fb,fw,lok)
+                        endif
+                    else
+                    call s2w1_wall_node(1,dt,ch(4,a,:,i,active_hi(ny)),cb(4,a,:,i,active_hi(ny)),u,v,weight, &
+                        S2W1_wall_ux(2),S2W1_wall_theta(2),fh,fb,fw,lok)
+                    endif
+                    if(.not.lok)then;ok=.false.;return;endif
+                    fyh(i,active_hi(ny),:)=fyh(i,active_hi(ny),:)+gw(a)*fh
+                    fyb(i,active_hi(ny),:)=fyb(i,active_hi(ny),:)+gw(a)*fb
+                    fyw(:,i,active_hi(ny))=fyw(:,i,active_hi(ny))+gw(a)*fw
+                    endif
+                enddo
+            enddo
+            call cpu_time(w2_end);w2_wall_s=w2_end-w2_start;w2_wall_calls=3*nx*(merge(1,0,lower_wall())+merge(1,0,upper_wall()))
+        endif
         ok=.true.
     end subroutine compute_flux
+
+    ! Time-integrated free-streaming kinetic wall flux at one tangential GQ3 point.
+    subroutine s2w1_wall_node(side,dt,hin,bin,u,v,weight,ux,theta,fh,fb,fw,ok)
+        integer,intent(in)::side
+        real(KREAL),intent(in)::dt,hin(:),bin(:),u(:),v(:),weight(:),ux,theta
+        real(KREAL),intent(out)::fh(:),fb(:),fw(4)
+        logical,intent(out)::ok
+        real(KREAL)::lambda,incidence,reflection,mh(size(u)),rho_w
+        integer::k
+        lambda=0.5_KREAL/theta
+        incidence=0.0_KREAL;reflection=0.0_KREAL
+        do k=1,size(u)
+            mh(k)=lambda/pi_d*exp(-lambda*((u(k)-ux)**2+v(k)**2))
+            if(real(side,KREAL)*v(k)>0.0_KREAL)then
+                incidence=incidence+weight(k)*v(k)*hin(k)
+            else
+                reflection=reflection+weight(k)*v(k)*mh(k)
+            endif
+        enddo
+        ok=ieee_is_finite(reflection).and.abs(reflection)>tiny(reflection)
+        if(.not.ok)return
+        rho_w=-incidence/reflection
+        ok=ieee_is_finite(rho_w).and.rho_w>0.0_KREAL
+        if(.not.ok)return
+        do k=1,size(u)
+            if(real(side,KREAL)*v(k)>0.0_KREAL)then
+                fh(k)=dt*v(k)*hin(k);fb(k)=dt*v(k)*bin(k)
+            else
+                fh(k)=dt*v(k)*rho_w*mh(k)
+                fb(k)=real(ck,KREAL)*theta*fh(k)
+            endif
+        enddo
+        call moment_2d(fh,fb,u,v,weight,fw,ok)
+        if(.not.ok)return
+        ok=abs(fw(1))<=gate*max(1.0_KREAL,dt*abs(incidence))
+    end subroutine s2w1_wall_node
+
+    ! Wall-only reevaluation for a temporary midpoint state.  It deliberately
+    ! calls the same cell-local reconstruction, h/b limiter and diffuse kernel
+    ! as the full W1 face path, without recomputing any interior UGKS faces.
+    subroutine s2w1_compute_wall_flux(h,b,u,v,weight,dx,dy,dt, &
+        lower_w,lower_h,lower_b,upper_w,upper_h,upper_b,limited,signed,ok)
+        real(KREAL),intent(in)::h(:,:,:),b(:,:,:),u(:),v(:),weight(:),dx,dy,dt
+        real(KREAL),intent(out)::lower_w(:,:),lower_h(:,:),lower_b(:,:)
+        real(KREAL),intent(out)::upper_w(:,:),upper_h(:,:),upper_b(:,:)
+        integer,intent(out)::limited,signed
+        logical,intent(out)::ok
+        real(KREAL)::lo_h(size(u),3),lo_b(size(u),3),up_h(size(u),3),up_b(size(u),3)
+        real(KREAL)::hf(4,3),bf(4,3),hn(4,3),ht(4,3),bn(4,3),bt(4,3)
+        real(KREAL)::fh(size(u)),fb(size(u)),fw(4),theta
+        integer::nx,ny,nvel,i,k,a
+        logical::lok,was_signed
+        nx=size(h,1);ny=size(h,2);nvel=size(h,3)
+        lower_w=0.0_KREAL;lower_h=0.0_KREAL;lower_b=0.0_KREAL
+        upper_w=0.0_KREAL;upper_h=0.0_KREAL;upper_b=0.0_KREAL
+        limited=0;signed=0;ok=.false.
+        if(S2W1_wall_mode/=1.or.size(u)/=nvel.or.size(b,3)/=nvel)return
+        do i=1,nx
+            do k=1,nvel
+                call reconstruct_cell_pair(h(:,:,k),b(:,:,k),i,1,dx,dy,hf,bf,hn,ht,bn,bt, &
+                    theta,was_signed,lok)
+                if(.not.lok)return
+                lo_h(k,:)=hf(3,:);lo_b(k,:)=bf(3,:)
+                if(was_signed)signed=signed+1
+                if((.not.was_signed).and.theta<1.0_KREAL)limited=limited+1
+                call reconstruct_cell_pair(h(:,:,k),b(:,:,k),i,ny,dx,dy,hf,bf,hn,ht,bn,bt, &
+                    theta,was_signed,lok)
+                if(.not.lok)return
+                up_h(k,:)=hf(4,:);up_b(k,:)=bf(4,:)
+                if(was_signed)signed=signed+1
+                if((.not.was_signed).and.theta<1.0_KREAL)limited=limited+1
+            enddo
+            do a=1,3
+                call s2w1_wall_node(-1,dt,lo_h(:,a),lo_b(:,a),u,v,weight, &
+                    S2W1_wall_ux(1),S2W1_wall_theta(1),fh,fb,fw,lok)
+                if(.not.lok)return
+                lower_h(i,:)=lower_h(i,:)+gw(a)*fh
+                lower_b(i,:)=lower_b(i,:)+gw(a)*fb
+                lower_w(:,i)=lower_w(:,i)+gw(a)*fw
+                call s2w1_wall_node(1,dt,up_h(:,a),up_b(:,a),u,v,weight, &
+                    S2W1_wall_ux(2),S2W1_wall_theta(2),fh,fb,fw,lok)
+                if(.not.lok)return
+                upper_h(i,:)=upper_h(i,:)+gw(a)*fh
+                upper_b(i,:)=upper_b(i,:)+gw(a)*fb
+                upper_w(:,i)=upper_w(:,i)+gw(a)*fw
+            enddo
+        enddo
+        ok=.true.
+    end subroutine s2w1_compute_wall_flux
+
+    ! The unchanged discrete instantaneous transport flux, without a face collision
+    ! closure. Used by the W1D dt^2 coefficient correction at the existing midpoint.
+    subroutine s2w1d_instantaneous_flux(h,b,u,v,dx,dy,fxh,fxb,fyh,fyb,limited,signed,ok)
+        real(KREAL),intent(in)::h(:,:,:),b(:,:,:),u(:),v(:),dx,dy
+        real(KREAL),intent(out)::fxh(:,:,:),fxb(:,:,:),fyh(:,:,:),fyb(:,:,:)
+        integer,intent(out)::limited,signed
+        logical,intent(out)::ok
+        real(KREAL),allocatable::ch(:,:,:,:,:),cb(:,:,:,:,:)
+        real(KREAL)::hf(4,3),bf(4,3),hn(4,3),ht(4,3),bn(4,3),bt(4,3),theta
+        real(KREAL)::rh(size(u)),rb(size(u))
+        type(FirstLayerPlane)::cacheh,cacheb
+        integer::nx,ny,nvel,k,i,j,a,ir
+        logical::lok,was_signed
+        nx=size(h,1);ny=size(h,2);nvel=size(h,3);limited=0;signed=0;ok=.false.
+        if(S2W1_wall_mode/=1)return
+        allocate(ch(nx,ny,nvel,4,3),cb(nx,ny,nvel,4,3))
+        do k=1,nvel
+            call prepare_first_layer_plane(cacheh,h(:,:,k),lok,.true.);if(.not.lok)return
+            call prepare_first_layer_plane(cacheb,b(:,:,k),lok,.true.);if(.not.lok)return
+            do j=1,ny;do i=1,nx
+                call reconstruct_cell_pair(h(:,:,k),b(:,:,k),i,j,dx,dy,hf,bf,hn,ht,bn,bt, &
+                    theta,was_signed,lok,cacheh,cacheb)
+                if(.not.lok)return
+                ch(i,j,k,:,:)=hf;cb(i,j,k,:,:)=bf
+                if(was_signed)signed=signed+1
+                if((.not.was_signed).and.theta<1.0_KREAL)limited=limited+1
+            enddo;enddo
+        enddo
+        fxh=0.0_KREAL;fxb=0.0_KREAL;fyh=0.0_KREAL;fyb=0.0_KREAL
+        do j=1,ny;do i=1,nx
+            ir=ip(i+1,nx)
+            do a=1,3
+                rh=merge(ch(i,j,:,2,a),ch(ir,j,:,1,a),u>=0.0_KREAL)
+                rb=merge(cb(i,j,:,2,a),cb(ir,j,:,1,a),u>=0.0_KREAL)
+                fxh(i,j,:)=fxh(i,j,:)+gw(a)*u*rh
+                fxb(i,j,:)=fxb(i,j,:)+gw(a)*u*rb
+                if(j<ny)then
+                    rh=merge(ch(i,j,:,4,a),ch(i,j+1,:,3,a),v>=0.0_KREAL)
+                    rb=merge(cb(i,j,:,4,a),cb(i,j+1,:,3,a),v>=0.0_KREAL)
+                    fyh(i,j,:)=fyh(i,j,:)+gw(a)*v*rh
+                    fyb(i,j,:)=fyb(i,j,:)+gw(a)*v*rb
+                endif
+            enddo
+        enddo;enddo
+        ok=.true.
+    end subroutine s2w1d_instantaneous_flux
+
+    ! One additional reconstruction, no equilibrium closure or accepted update.
+    subroutine s2w2r_instantaneous(h,b,u,v,weight,dx,dy,fxh,fxb,fyh,fyb,lh,lb,limited,signed,ok)
+        real(KREAL),intent(in)::h(:,:,:),b(:,:,:),u(:),v(:),weight(:),dx,dy
+        real(KREAL),intent(out)::fxh(:,:,:),fxb(:,:,:),fyh(:,:,:),fyb(:,:,:),lh(:,:),lb(:,:)
+        integer,intent(out)::limited,signed
+        logical,intent(out)::ok
+        real(KREAL),allocatable::ch(:,:,:,:,:),cb(:,:,:,:,:)
+        real(KREAL)::hf(4,3),bf(4,3),hn(4,3),ht(4,3),bn(4,3),bt(4,3),theta
+        real(KREAL)::rh(size(u)),rb(size(u)),fh(size(u)),fb(size(u)),fw(4)
+        type(FirstLayerPlane)::cacheh,cacheb
+        integer::nx,ny,nvel,k,i,j,a,ir
+        logical::lok,was_signed
+        nx=size(h,1);ny=size(h,2);nvel=size(h,3);limited=0;signed=0;ok=.false.
+        allocate(ch(nx,ny,nvel,4,3),cb(nx,ny,nvel,4,3))
+        do k=1,nvel
+            call prepare_first_layer_plane(cacheh,h(:,:,k),lok,.true.);if(.not.lok)return
+            call prepare_first_layer_plane(cacheb,b(:,:,k),lok,.true.);if(.not.lok)return
+            do j=1,ny;do i=1,nx
+                call reconstruct_cell_pair(h(:,:,k),b(:,:,k),i,j,dx,dy,hf,bf,hn,ht,bn,bt, &
+                    theta,was_signed,lok,cacheh,cacheb)
+                if(.not.lok)return
+                ch(i,j,k,:,:)=hf;cb(i,j,k,:,:)=bf
+                if(was_signed)signed=signed+1
+                if((.not.was_signed).and.theta<1.0_KREAL)limited=limited+1
+            enddo;enddo
+        enddo
+        fxh=0;fxb=0;fyh=0;fyb=0;lh=0;lb=0
+        do j=1,ny;do i=1,nx
+            ir=ip(i+1,nx)
+            do a=1,3
+                rh=merge(ch(i,j,:,2,a),ch(ir,j,:,1,a),u>=0.0_KREAL)
+                rb=merge(cb(i,j,:,2,a),cb(ir,j,:,1,a),u>=0.0_KREAL)
+                fxh(i,j,:)=fxh(i,j,:)+gw(a)*u*rh
+                fxb(i,j,:)=fxb(i,j,:)+gw(a)*u*rb
+                if(j<ny)then
+                    rh=merge(ch(i,j,:,4,a),ch(i,j+1,:,3,a),v>=0.0_KREAL)
+                    rb=merge(cb(i,j,:,4,a),cb(i,j+1,:,3,a),v>=0.0_KREAL)
+                    fyh(i,j,:)=fyh(i,j,:)+gw(a)*v*rh
+                    fyb(i,j,:)=fyb(i,j,:)+gw(a)*v*rb
+                endif
+            enddo
+        enddo;enddo
+        do i=1,nx;do a=1,3
+            call s2w2_instantaneous_node(-1,ch(i,1,:,3,a),cb(i,1,:,3,a),u,v,weight, &
+                S2W1_wall_ux(1),S2W1_wall_theta(1),fh,fb,fw,lok)
+            if(.not.lok)return
+            lh(i,:)=lh(i,:)+gw(a)*fh;lb(i,:)=lb(i,:)+gw(a)*fb
+            call s2w2_instantaneous_node(1,ch(i,ny,:,4,a),cb(i,ny,:,4,a),u,v,weight, &
+                S2W1_wall_ux(2),S2W1_wall_theta(2),fh,fb,fw,lok)
+            if(.not.lok)return
+            fyh(i,ny,:)=fyh(i,ny,:)+gw(a)*fh;fyb(i,ny,:)=fyb(i,ny,:)+gw(a)*fb
+        enddo;enddo
+        ok=.true.
+    end subroutine s2w2r_instantaneous
+
+    subroutine s2w2r_correct(w,h,b,mh,mb,u,v,weight,dx,dy,dt,fxw,fyw,fxh,fxb,fyh,fyb,lw,lh,lb, &
+        x0h,x0b,y0h,y0b,xkh,xkb,ykh,ykb,l0h,l0b,lkh,lkb,diag,predict_s,instant_s,apply_s,ok)
+        real(KREAL),intent(in)::w(:,:,:),h(:,:,:),b(:,:,:),mh(:,:,:),mb(:,:,:),u(:),v(:),weight(:),dx,dy,dt
+        real(KREAL),intent(in)::x0h(:,:,:),x0b(:,:,:),y0h(:,:,:),y0b(:,:,:),xkh(:,:,:),xkb(:,:,:),ykh(:,:,:),ykb(:,:,:)
+        real(KREAL),intent(in)::l0h(:,:),l0b(:,:),lkh(:,:),lkb(:,:)
+        real(KREAL),intent(inout)::fxw(:,:,:),fyw(:,:,:),fxh(:,:,:),fxb(:,:,:),fyh(:,:,:),fyb(:,:,:),lw(:,:),lh(:,:),lb(:,:)
+        real(KREAL),intent(out)::diag(6),predict_s,instant_s,apply_s
+        logical,intent(out)::ok
+        real(KREAL),allocatable::ws(:,:,:),hs(:,:,:),bs(:,:,:),xh(:,:,:),xb(:,:,:),yh(:,:,:),yb(:,:,:),bh(:,:),bb(:,:)
+        real(KREAL)::dlh(size(u)),dlb(size(u)),mom(4),rho,ux,vy,theta_gas,p,t0,t1,err,oldmom(4)
+        integer::nx,ny,i,j,im,il,is,du,env_status
+        character(len=8)::save_env
+        character(len=80)::path
+        logical::lok
+        nx=size(h,1);ny=size(h,2);ok=.false.;diag=0;predict_s=0;instant_s=0;apply_s=0
+        allocate(ws(4,nx,ny),hs(nx,ny,size(u)),bs(nx,ny,size(u)),xh(nx,ny,size(u)),xb(nx,ny,size(u)), &
+            yh(nx,ny,size(u)),yb(nx,ny,size(u)),bh(nx,size(u)),bb(nx,size(u)))
+        ws=w;hs=h;bs=b
+        call cpu_time(t0)
+        do j=1,ny;do i=1,nx
+            im=ip(i-1,nx)
+            dlh=-(x0h(i,j,:)-x0h(im,j,:))/dx;dlb=-(x0b(i,j,:)-x0b(im,j,:))/dx
+            if(j==1)then
+                dlh=dlh-(y0h(i,j,:)-l0h(i,:))/dy;dlb=dlb-(y0b(i,j,:)-l0b(i,:))/dy
+            else
+                dlh=dlh-(y0h(i,j,:)-y0h(i,j-1,:))/dy;dlb=dlb-(y0b(i,j,:)-y0b(i,j-1,:))/dy
+            endif
+            call moment_2d(dlh,dlb,u,v,weight,mom,lok);if(.not.lok)return
+            ws(:,i,j)=w(:,i,j)+0.5_KREAL*dt*mom
+            hs(i,j,:)=h(i,j,:)+0.5_KREAL*dt*(dlh+(mh(i,j,:)-h(i,j,:))/tau0)
+            bs(i,j,:)=b(i,j,:)+0.5_KREAL*dt*(dlb+(mb(i,j,:)-b(i,j,:))/tau0)
+            call primitive(ws(:,i,j),rho,ux,vy,theta_gas,p,lok)
+            if(.not.lok)exit
+            call moment_2d(hs(i,j,:),bs(i,j,:),u,v,weight,mom,lok);if(.not.lok)exit
+            diag(1)=max(diag(1),maxval(abs(mom-ws(:,i,j)))/max(1.0_KREAL,maxval(abs(ws(:,i,j)))))
+        enddo
+            if(.not.lok)exit
+        enddo
+        diag(2)=minval(hs);diag(3)=minval(bs)
+        if(.not.lok.or.diag(1)>gate.or..not.all(ieee_is_finite(hs)).or..not.all(ieee_is_finite(bs)))then
+            call write_state('w2r_predictor_rejected.bin',ws,hs,bs,u,v,weight,dt/2)
+            call write_state('w2r_last_accepted.bin',w,h,b,u,v,weight,0.0_KREAL)
+            return
+        endif
+        call cpu_time(t1);predict_s=t1-t0
+        call cpu_time(t0)
+        call s2w2r_instantaneous(hs,bs,u,v,weight,dx,dy,xh,xb,yh,yb,bh,bb,il,is,lok)
+        diag(4)=real(il,KREAL);diag(5)=real(is,KREAL)
+        if(.not.lok)then
+            call write_state('w2r_predictor_rejected.bin',ws,hs,bs,u,v,weight,dt/2)
+            call write_state('w2r_last_accepted.bin',w,h,b,u,v,weight,0.0_KREAL)
+            return
+        endif
+        call cpu_time(t1);instant_s=t1-t0
+        call get_environment_variable('S2W2R_SAVE_PREDICTOR',save_env,status=env_status)
+        if(env_status==0.and.trim(save_env)=='1')then
+            w2r_research_calls=w2r_research_calls+1
+            write(path,'(A,I3.3,A)')'w2r_predictor_step',w2r_research_calls,'.bin'
+            call write_state(trim(path),ws,hs,bs,u,v,weight,dt/2)
+            write(path,'(A,I3.3,A)')'w2r_coefficients_step',w2r_research_calls,'.bin'
+            open(newunit=du,file=trim(path),status='replace',access='stream',form='unformatted')
+            write(du)int(nx,KINT),int(ny,KINT),int(size(u),KINT),dt
+            write(du)fxh,fxb,fyh,fyb,lh,lb,x0h,x0b,y0h,y0b,l0h,l0b, &
+                xkh,xkb,ykh,ykb,lkh,lkb,xh,xb,yh,yb,bh,bb
+            close(du)
+        endif
+        call cpu_time(t0)
+        ! Arrays xh/etc become proposed shared integrals before any official flux is replaced.
+        xh=fxh+dt*(xh-x0h)-0.5_KREAL*dt*dt*xkh
+        xb=fxb+dt*(xb-x0b)-0.5_KREAL*dt*dt*xkb
+        yh=fyh+dt*(yh-y0h)-0.5_KREAL*dt*dt*ykh
+        yb=fyb+dt*(yb-y0b)-0.5_KREAL*dt*dt*ykb
+        bh=lh+dt*(bh-l0h)-0.5_KREAL*dt*dt*lkh
+        bb=lb+dt*(bb-l0b)-0.5_KREAL*dt*dt*lkb
+        do i=1,nx
+            call moment_2d(bh(i,:),bb(i,:),u,v,weight,mom,lok);if(.not.lok)return
+            diag(6)=max(diag(6),abs(mom(1)))
+            call moment_2d(yh(i,ny,:),yb(i,ny,:),u,v,weight,mom,lok);if(.not.lok)return
+            diag(6)=max(diag(6),abs(mom(1)))
+        enddo
+        if(diag(6)>gate)return
+        if(.not.all(ieee_is_finite(xh)).or..not.all(ieee_is_finite(xb)).or. &
+            .not.all(ieee_is_finite(yh)).or..not.all(ieee_is_finite(yb)))return
+        fxh=xh;fxb=xb;fyh=yh;fyb=yb;lh=bh;lb=bb
+        do j=1,ny;do i=1,nx
+            call moment_2d(fxh(i,j,:),fxb(i,j,:),u,v,weight,fxw(:,i,j),lok);if(.not.lok)return
+            call moment_2d(fyh(i,j,:),fyb(i,j,:),u,v,weight,fyw(:,i,j),lok);if(.not.lok)return
+        enddo;enddo
+        do i=1,nx
+            call moment_2d(lh(i,:),lb(i,:),u,v,weight,lw(:,i),lok);if(.not.lok)return
+        enddo
+        call cpu_time(t1);apply_s=t1-t0;ok=.true.
+    end subroutine s2w2r_correct
 
     subroutine build_targets(w,u,v,weight,mh,mb,kxh,kxb,kyh,kyb,eah,eab,kappa,target_error,ok)
         real(KREAL),intent(in)::w(:,:,:),u(:),v(:),weight(:)
@@ -709,8 +1257,9 @@ contains
         nx=size(w,2);ny=size(w,3);mh=0.0_KREAL;mb=0.0_KREAL;kxh=0.0_KREAL;kxb=0.0_KREAL
         kyh=0.0_KREAL;kyb=0.0_KREAL;eah=0.0_KREAL;eab=0.0_KREAL;kappa=0.0_KREAL
         target_error=0.0_KREAL
-        do j=1,ny
-            do i=1,nx
+        do j=active_lo(),active_hi(ny)
+            do i=xlo(),xhi(nx)
+                failure_i=i;failure_j=j
                 if(trim(adjustl(TimeIntegration_method))=='S2D1VL')then
                     call old_target_at(w(:,i,j),[0.0_KREAL,0.0_KREAL],u,v,tmh,tmb,teah,teab,lok)
                     if(.not.lok)then;ok=.false.;return;endif
@@ -722,7 +1271,7 @@ contains
                     target_error=max(target_error,err)
                 else
                     do m=1,4
-                        call s2d1_cell9(w(m,:,:),i,j,nodes(m,:,:),lok)
+                        call s2d1_cell9(w(m,:,:),i,j,nodes(m,:,:),lok,S2W1_wall_mode==1)
                         if(.not.lok)then;ok=.false.;return;endif
                     enddo
                     avg=0.0_KREAL
@@ -742,7 +1291,7 @@ contains
                     if(.not.lok)then;ok=.false.;return;endif
                     call heat(w(:,i,j),kyh(i,j,:),kyb(i,j,:),u,v,weight,kappa(:,2,i,j),lok)
                     if(.not.lok)then;ok=.false.;return;endif
-                    call analytic_maxwellian_2d(w(:,i,j),1,u,v,eah(i,j,:),eab(i,j,:),lok)
+                    call analytic_maxwellian_2d(w(:,i,j),ck,u,v,eah(i,j,:),eab(i,j,:),lok)
                     if(.not.lok)then;ok=.false.;return;endif
                 endif
             enddo
@@ -767,7 +1316,7 @@ contains
         real(KREAL),allocatable::wn(:,:,:),hs(:,:,:),bs(:,:,:),hn(:,:,:),bn(:,:,:)
         real(KREAL),allocatable::mhn(:,:,:),mbn(:,:,:),kxhn(:,:,:),kxbn(:,:,:),kyhn(:,:,:),kybn(:,:,:)
         real(KREAL),allocatable::eahn(:,:,:),eabn(:,:,:),kapn(:,:,:,:)
-        real(KREAL)::face_err,target_err,beta,rhs(2),rnew(2),rold(2),rhat(2),qtmp(2),a22(2,2),det
+        real(KREAL)::face_err,target_err,beta,beta_old,rhs(2),rnew(2),rold(2),rhat(2),qtmp(2),a22(2,2),det
         real(KREAL)::rh(size(u)),rb(size(u)),eqh(size(u)),eqb(size(u)),mom(4),scale,cnres,mmerr
         real(KREAL)::t0,t1
         logical::lok
@@ -791,14 +1340,17 @@ contains
                 face_err,limited,signed,lok)
             call cpu_time(t1);flux_seconds=t1-t0
             if(.not.lok)return
-            do j=1,ny;jm=ip(j-1,ny)
-                do i=1,nx;im=ip(i-1,nx)
+            do j=active_lo(),active_hi(ny);jm=ip(j-1,ny)
+                do i=xlo(),xhi(nx)
+                failure_i=i;failure_j=j;im=ip(i-1,nx)
                     wn(:,i,j)=w(:,i,j)-(fxw(:,i,j)-fxw(:,im,j))/dx-(fyw(:,i,j)-fyw(:,i,jm))/dy
                     hs(i,j,:)=h(i,j,:)-(fxh(i,j,:)-fxh(im,j,:))/dx-(fyh(i,j,:)-fyh(i,jm,:))/dy
                     bs(i,j,:)=b(i,j,:)-(fxb(i,j,:)-fxb(im,j,:))/dx-(fyb(i,j,:)-fyb(i,jm,:))/dy
                 enddo
             enddo
         endif
+        call exchange_w(wn)
+        hn=h;bn=b
         call cpu_time(t0)
         if(trim(adjustl(TimeIntegration_method))=='S2D1VL')then
             mhn=0.0_KREAL;mbn=0.0_KREAL;kxhn=0.0_KREAL;kxbn=0.0_KREAL
@@ -810,8 +1362,15 @@ contains
         endif
         beta=dt/(2.0_KREAL*tau0);cnres=0.0_KREAL;mmerr=0.0_KREAL
         diag(9)=huge(1.0_KREAL);diag(10)=0.0_KREAL;diag(11)=huge(1.0_KREAL);diag(12)=0.0_KREAL
-        do j=1,ny
-            do i=1,nx
+        do j=active_lo(),active_hi(ny)
+            do i=xlo(),xhi(nx)
+                failure_i=i;failure_j=j
+                beta_old=beta
+                if(S2PhysicalGas==1)then
+                    beta_old=dt/(2.0_KREAL*s2_tau(w(:,i,j)))
+                    beta=dt/(2.0_KREAL*s2_tau(wn(:,i,j)))
+                endif
+                diag(7)=max(diag(7),2.0_KREAL*beta_old,2.0_KREAL*beta)
                 if(trim(adjustl(TimeIntegration_method))=='S2D1VL')then
                     call heat(w(:,i,j),h(i,j,:),b(i,j,:),u,v,weight,rold,lok);if(.not.lok)return
                     call old_target_at(w(:,i,j),rold,u,v,rh,rb,eahn(i,j,:),eabn(i,j,:),lok)
@@ -831,8 +1390,8 @@ contains
                 else
                     call heat(w(:,i,j),h(i,j,:)-mh(i,j,:),b(i,j,:)-mb(i,j,:),u,v,weight,rold,lok)
                     if(.not.lok)return
-                    rh=hs(i,j,:)+beta*(mh(i,j,:)+kxh(i,j,:)*rold(1)+kyh(i,j,:)*rold(2)-h(i,j,:))
-                    rb=bs(i,j,:)+beta*(mb(i,j,:)+kxb(i,j,:)*rold(1)+kyb(i,j,:)*rold(2)-b(i,j,:))
+                    rh=hs(i,j,:)+beta_old*(mh(i,j,:)+kxh(i,j,:)*rold(1)+kyh(i,j,:)*rold(2)-h(i,j,:))
+                    rb=bs(i,j,:)+beta_old*(mb(i,j,:)+kxb(i,j,:)*rold(1)+kyb(i,j,:)*rold(2)-b(i,j,:))
                     call heat(wn(:,i,j),rh,rb,u,v,weight,rhs,lok);if(.not.lok)return
                     call heat(wn(:,i,j),mhn(i,j,:),mbn(i,j,:),u,v,weight,qtmp,lok);if(.not.lok)return
                     rhs=rhs-qtmp
@@ -866,7 +1425,7 @@ contains
         call cpu_time(t1);collision_seconds=t1-t0
         diag(1)=face_err;diag(2)=target_err;diag(3)=cnres;diag(4)=mmerr
         diag(5)=real(limited,KREAL);diag(6)=real(signed,KREAL)
-        diag(7)=dt/tau0;diag(8)=dt*(maxval(abs(u))/dx+maxval(abs(v))/dy)
+        diag(8)=dt*(maxval(abs(u))/dx+maxval(abs(v))/dy)
         if(.not.all(ieee_is_finite(wn)).or..not.all(ieee_is_finite(hn)).or..not.all(ieee_is_finite(bn)))return
         if(cnres>gate.or.mmerr>gate)return
         w=wn;h=hn;b=bn;mh=mhn;mb=mbn;kxh=kxhn;kxb=kxbn;kyh=kyhn;kyb=kybn
@@ -876,7 +1435,7 @@ contains
     end subroutine advance_step
 
     subroutine init_velocity(u,v,weight,raw_node,raw_weight)
-        real(KREAL),intent(out)::u(:),v(:),weight(:),raw_node(16),raw_weight(16)
+        real(KREAL),intent(out)::u(:),v(:),weight(:),raw_node(:),raw_weight(:)
         real(KREAL),parameter::x(16)=[-4.68873893930581875_KREAL,-3.86944790486012291_KREAL, &
             -3.17699916197995602_KREAL,-2.54620215784748138_KREAL,-1.95178799091625388_KREAL, &
             -1.38025853919888086_KREAL,-0.82295144914465590_KREAL,-0.27348104613815250_KREAL, &
@@ -891,6 +1450,9 @@ contains
             2.32098084486520325e-7_KREAL,2.65480747401116728e-10_KREAL]
         real(KREAL)::ue(16),we(16)
         integer::i,j,k
+        if(VelocityMode()/='full16')then
+            call FillVelocity(u,v,weight,raw_node,raw_weight);return
+        endif
         raw_node=x;raw_weight=wr;ue=sqrt(2.0_KREAL)*x;we=sqrt(2.0_KREAL)*exp(x*x)*wr
         do j=1,16;do i=1,16;k=i+(j-1)*16
             u(k)=ue(i);v(k)=ue(j);weight(k)=we(i)*we(j)
@@ -919,13 +1481,13 @@ contains
         real(KREAL),intent(in)::w(:,:,:),h(:,:,:),b(:,:,:),eah(:,:,:),eab(:,:,:)
         real(KREAL),intent(in)::u(:),v(:),weight(:),dx,dy,time
         integer::unit,i,j
-        real(KREAL)::rho,ux,vy,temp,p,q(2),x,y
+        real(KREAL)::rho,ux,vy,theta_gas,p,q(2),x,y
         logical::ok
         open(newunit=unit,file=path,status='replace',action='write')
         write(unit,'(A)')'x,y,rho,p,qx,qy,U,V,time'
         do j=1,size(h,2);y=(real(j,KREAL)-0.5_KREAL)*dy
             do i=1,size(h,1);x=(real(i,KREAL)-0.5_KREAL)*dx
-                call primitive(w(:,i,j),rho,ux,vy,temp,p,ok)
+                call primitive(w(:,i,j),rho,ux,vy,theta_gas,p,ok)
                 call heat(w(:,i,j),h(i,j,:)-eah(i,j,:),b(i,j,:)-eab(i,j,:),u,v,weight,q,ok)
                 write(unit,'(9(ES24.16,:,","))')x,y,rho,p,q(1),q(2),ux,vy,time
             enddo

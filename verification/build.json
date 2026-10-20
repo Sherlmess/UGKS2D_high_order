@@ -1,9 +1,0 @@
-{
-  "exit_code": 0,
-  "wall_s": 28.508031292000002,
-  "compiler": "GNU Fortran (Homebrew GCC 15.2.0) 15.2.0\nCopyright (C) 2025 Free Software Foundation, Inc.\nThis is free software; see the source for copying conditions.  There is NO\nwarranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.\n\n",
-  "platform": "macOS-27.0-arm64-arm-64bit",
-  "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk",
-  "binary_sha256": "865cf843f7e688b4f9c0e9b454568da7a9e532748374eb837014c1cdd91ddb7f",
-  "termination_test": "TERMINATION_CONTROL_PASS"
-}

@@ -20,14 +20,19 @@
 
 
 program UGKS2D
+    use mod_S2CartesianMPI, only: CartesianStats
+    use mod_S2MPI1, only: RunS2MPI1
+    use mod_S2MPI1Layout, only: slab_enabled
     use ImportPara
     use mpi
     use mpi_wrapper
     use InitializeFlow
     use Solver
+    use mod_R5Observe,only:RecordTerminalIO
     use Output
     use mod_S2D1, only: IsS2D1,RunS2D1
     implicit none
+    real(KREAL)::s2_final_output_start
     
     !Initial of MPI
     call MPI_Init(ierr) 
@@ -41,6 +46,12 @@ program UGKS2D
     
     !Import parameters
     call InitPara()
+
+    if(slab_enabled)then
+        call RunS2MPI1()
+        call MPI_Finalize(ierr)
+        stop
+    endif
 
     if(IsS2D1()) then
         call RunS2D1()
@@ -58,7 +69,10 @@ program UGKS2D
     call Solve_UGKS()
 
     !Output solution
+    s2_final_output_start=MPI_Wtime()
     call Output_result()
+    call RecordTerminalIO(MPI_Wtime()-s2_final_output_start)
+    call CartesianStats(s2_loop_total,time_output_acc+MPI_Wtime()-s2_final_output_start,s2_comm_loop)
     
     !Finalize MPI
     call MPI_Finalize(ierr)

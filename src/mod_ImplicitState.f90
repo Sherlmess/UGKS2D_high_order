@@ -71,6 +71,12 @@ module mod_ImplicitState
         real(KREAL) :: post_sweep_delta=0.0_KREAL
     end type ImplicitFailureRecord
 
+    integer :: r4_forward_scans=0,r4_backward_scans=0,macro_pr_passes=0
+    logical :: r5_force_true_updates=.false.
+    real(KREAL) :: r5_macro_alpha=1.0_KREAL,r5_raw_h=0.0_KREAL,r5_raw_b=0.0_KREAL
+    real(KREAL), allocatable :: physical_collision_h(:,:,:),physical_collision_b(:,:,:)
+    real(KREAL), allocatable :: physical_equilibrium_h(:,:,:),physical_equilibrium_b(:,:,:)
+    real(KREAL), allocatable :: low_collision_old_h(:,:,:),low_collision_old_b(:,:,:)
     type(ImplicitFailureRecord) :: implicit_failure
     real(KREAL), allocatable :: rate_w(:,:,:)
     real(KREAL), allocatable :: stream_h(:,:,:), stream_b(:,:,:)
@@ -111,6 +117,12 @@ contains
         allocate(equilibrium_h(Nvel,1:nx,1:ny), equilibrium_b(Nvel,1:nx,1:ny))
         allocate(equilibrium_increment_h(Nvel,1:nx,1:ny),equilibrium_increment_b(Nvel,1:nx,1:ny))
         if (.not.allocated(mirror_u_index)) allocate(mirror_u_index(Nvel), mirror_v_index(Nvel))
+        allocate(physical_collision_h(Nvel,nx,ny),physical_collision_b(Nvel,nx,ny))
+        allocate(physical_equilibrium_h(Nvel,nx,ny),physical_equilibrium_b(Nvel,nx,ny))
+        allocate(low_collision_old_h(Nvel,nx,ny),low_collision_old_b(Nvel,nx,ny))
+        physical_collision_h=0;physical_collision_b=0
+        physical_equilibrium_h=0;physical_equilibrium_b=0
+        low_collision_old_h=0;low_collision_old_b=0
         call ResetImplicitCorrections()
         rate_w=0.0_KREAL; stream_h=0.0_KREAL; stream_b=0.0_KREAL
         w_tilde=0.0_KREAL; tau_tilde=0.0_KREAL; q_frozen=0.0_KREAL

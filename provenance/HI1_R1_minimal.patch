@@ -1,0 +1,118 @@
+--- a/src/mod_S2MultiscaleWall.f90
++++ b/src/mod_S2MultiscaleWall.f90
+@@ -6,6 +6,7 @@
+     use Precision, only: KINT,KREAL
+     use flow_para, only: ck,Pr,S2PhysicalGas
+     use mod_S2PhysicalGas, only: s2_tau
++    use mod_CorrectedWF2DClosure, only: discrete_equilibrium_q_2d
+     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
+     implicit none
+     private
+@@ -53,7 +54,7 @@
+         real(KREAL)::tau_wall,heat_local(2),corrh(size(u)),corrb(size(u)),coeff,qdot,shapeh
+         real(KREAL)::prim_g(4),wg(4),wc(4),sw(4),sw_t(4),an(4),at(4),aTtime(4)
+         real(KREAL)::Mu(0:MNUM),Mv(0:MTUM),Mxi(0:2),MuL(0:MNUM),MuR(0:MNUM),mt(5)
+-        real(KREAL)::mh(size(u)),mb(size(u)),wall(size(u)),ginh(size(u)),ginb(size(u))
++        real(KREAL)::mh(size(u)),mb(size(u)),wall(size(u)),wallb(size(u)),ginh(size(u)),ginb(size(u))
+         real(KREAL)::vn,vt,v2,lambda,p,incidence,reflection,rhow,Han,Hatan,Hatime,Ban,Batan,Batime
+         integer::k
+         if(S2PhysicalGas==0)then
+@@ -82,10 +83,12 @@
+             ! ht/bt arrive as Cartesian +x derivatives. Local tangent is -x.
+             sw_t=sw_t+weight(k)*[-ht(k),-vn*ht(k),-vt*ht(k), &
+                 -0.5_KREAL*(v2*ht(k)+bt(k))]
+-            mh(k)=prim_g(1)*lambda/PI*exp(-lambda*(vn*vn+(vt+ux)**2))
+-            mb(k)=real(ck,KREAL)/(2.0_KREAL*lambda)*mh(k)
+-            wall(k)=mh(k)/prim_g(1)
+-        enddo
++        enddo
++        ! Use the same discrete conservative Q as the S2 volume target.
++        ! Both reduced distributions must share its fitted thermal width.
++        call wall_equilibrium(prim_g(1),ux,theta,u,v,weight,mh,mb,ok)
++        if(.not.ok)return
++        wall=mh/prim_g(1);wallb=mb/prim_g(1)
+         at=MicroSlope(prim_g,sw_t)
+         call CalcMoment(prim_g,Mu,Mv,Mxi,MuL,MuR)
+         sw=-prim_g(1)*(Moment_auvxi(an,Mu,Mv,Mxi,1,0)+Moment_auvxi(at,Mu,Mv,Mxi,0,1))
+@@ -144,7 +147,7 @@
+             if(real(side,KREAL)*v(k)>0.0_KREAL)then
+                 fh(k)=v(k)*ginh(k);fb(k)=v(k)*ginb(k)
+             else
+-                fh(k)=dt*v(k)*rhow*wall(k);fb(k)=real(ck,KREAL)*theta*fh(k)
++                fh(k)=dt*v(k)*rhow*wall(k);fb(k)=dt*v(k)*rhow*wallb(k)
+             endif
+             fw=fw+weight(k)*[fh(k),u(k)*fh(k),v(k)*fh(k), &
+                 0.5_KREAL*((u(k)**2+v(k)**2)*fh(k)+fb(k))]
+@@ -167,8 +170,8 @@
+                     f0_h(k)=v(k)*hin(k);f0_b(k)=v(k)*bin(k)
+                     k_h(k)=v(k)*qh(k);k_b(k)=v(k)*qb(k)
+                 else
+-                    f0_h(k)=v(k)*r0*wall(k);f0_b(k)=real(ck,KREAL)*theta*f0_h(k)
+-                    k_h(k)=v(k)*r1*wall(k);k_b(k)=real(ck,KREAL)*theta*k_h(k)
++                    f0_h(k)=v(k)*r0*wall(k);f0_b(k)=v(k)*r0*wallb(k)
++                    k_h(k)=v(k)*r1*wall(k);k_b(k)=v(k)*r1*wallb(k)
+                 endif
+             enddo
+             if(abs(sum(weight*f0_h))>gate.or.abs(sum(weight*k_h))>gate)return
+@@ -186,10 +189,16 @@
+         real(KREAL),intent(in)::hin(:),bin(:),u(:),v(:),weight(:),ux,theta
+         real(KREAL),intent(out)::fh(:),fb(:),fw(4)
+         logical,intent(out)::ok
+-        real(KREAL)::wall(size(u)),lambda,inc,den,rho
++        real(KREAL)::wall(size(u)),wallb(size(u)),lambda,inc,den,rho
+         integer::k
+         ok=.false.;lambda=0.5_KREAL/theta;inc=0;den=0;fw=0
+-        wall=lambda/PI*exp(-lambda*(v*v+(u-ux)**2))
++        if(S2PhysicalGas==0)then
++            wall=lambda/PI*exp(-lambda*(v*v+(u-ux)**2))
++            wallb=real(ck,KREAL)*theta*wall
++        else
++            call wall_equilibrium(1.0_KREAL,ux,theta,u,v,weight,wall,wallb,ok)
++            if(.not.ok)return
++        endif
+         do k=1,size(u)
+             if(side*v(k)>0.0_KREAL)then
+                 inc=inc+weight(k)*v(k)*hin(k)
+@@ -203,13 +212,30 @@
+             if(side*v(k)>0.0_KREAL)then
+                 fh(k)=v(k)*hin(k);fb(k)=v(k)*bin(k)
+             else
+-                fh(k)=v(k)*rho*wall(k);fb(k)=real(ck,KREAL)*theta*fh(k)
++                fh(k)=v(k)*rho*wall(k)
++                if(S2PhysicalGas==0)then
++                    ! Preserve legacy floating-point evaluation order as well.
++                    fb(k)=real(ck,KREAL)*theta*fh(k)
++                else
++                    fb(k)=v(k)*rho*wallb(k)
++                endif
+             endif
+             fw=fw+weight(k)*[fh(k),u(k)*fh(k),v(k)*fh(k), &
+                 0.5_KREAL*((u(k)**2+v(k)**2)*fh(k)+fb(k))]
+         enddo
+         ok=all(ieee_is_finite(fh)).and.all(ieee_is_finite(fb)).and.abs(fw(1))<=gate*max(1.0_KREAL,abs(inc))
+     end subroutine s2w2_instantaneous_node
++
++    ! Diffuse wall shape with the existing S2 four-moment closure. No flux
++    ! projection: rhow still closes the actual incident half-space mass flux.
++    subroutine wall_equilibrium(rho,ux,theta,u,v,weight,mh,mb,ok)
++        real(KREAL),intent(in)::rho,ux,theta,u(:),v(:),weight(:)
++        real(KREAL),intent(out)::mh(:),mb(:)
++        logical,intent(out)::ok
++        real(KREAL)::w(4),fit(4),jac(4,4)
++        w=[rho,rho*ux,0.0_KREAL,rho*(real(ck+2,KREAL)*theta/2.0_KREAL+ux*ux/2.0_KREAL)]
++        call discrete_equilibrium_q_2d(w,ck,u,v,weight,mh,mb,fit,jac,ok)
++    end subroutine wall_equilibrium
+ 
+     function MicroSlope(prim,sw)
+         real(KREAL), intent(in)                         :: prim(4),sw(4)
+--- a/Makefile
++++ b/Makefile
+@@ -89,7 +89,7 @@
+ $(OBJ_DIR)/mod_Evolution.o: $(OBJ_DIR)/mod_S2NativeAdapter.o $(OBJ_DIR)/mod_S2D1.o $(OBJ_DIR)/mod_Interpolation.o $(OBJ_DIR)/mod_Tools.o $(OBJ_DIR)/mod_Globaldata.o
+ $(OBJ_DIR)/mod_Solve.o: $(OBJ_DIR)/mod_S2SteadyIteration.o $(OBJ_DIR)/mod_S2NativeAdapter.o $(OBJ_DIR)/mod_S2D1.o $(OBJ_DIR)/mod_UnsteadyImplicit.o $(OBJ_DIR)/mod_InitializeFlow.o $(OBJ_DIR)/mod_SteadyImplicit.o $(OBJ_DIR)/mod_Output.o $(OBJ_DIR)/mod_Evolution.o $(OBJ_DIR)/mod_Residual.o $(OBJ_DIR)/mod_TimeIntegrator.o $(OBJ_DIR)/mod_Interpolation.o $(OBJ_DIR)/mod_Boundary.o $(OBJ_DIR)/mod_Tools.o $(OBJ_DIR)/mod_Globaldata.o $(OBJ_DIR)/mod_MPI.o
+ $(OBJ_DIR)/main_UGKS2D.o: $(OBJ_DIR)/mod_S2D1.o
+-$(OBJ_DIR)/mod_S2MultiscaleWall.o: $(OBJ_DIR)/mod_Globaldata.o
++$(OBJ_DIR)/mod_S2MultiscaleWall.o: $(OBJ_DIR)/mod_Globaldata.o $(OBJ_DIR)/mod_CorrectedWF2DClosure.o
+ $(OBJ_DIR)/mod_S2D1.o: $(OBJ_DIR)/mod_S2MultiscaleWall.o
+ $(OBJ_DIR)/mod_W3BObserver.o: $(OBJ_DIR)/mod_Globaldata.o
+ $(OBJ_DIR)/mod_Solve.o: $(OBJ_DIR)/mod_W3BObserver.o

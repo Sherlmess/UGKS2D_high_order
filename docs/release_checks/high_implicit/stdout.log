@@ -1,0 +1,51 @@
+-------------UGKS2D-DIS simulation beginning: Parallel in XY, version 2.0 (by JHOU, oujihui@tju.edu.cn)-------------
+S2 wall side 1 T_native, theta, lambda:   2.0000000000000000E+00  1.0000000000000000E+00  5.0000000000000000E-01
+S2 wall side 2 T_native, theta, lambda:   2.0000000000000000E+00  1.0000000000000000E+00  5.0000000000000000E-01
+-------------------------------Parameters check----------------------------------
+              Ma=     0.00000000            Re=     1.00000000            Kn=     0.09991823
+             AOA=     0.00000000          Tinf=     2.00000000            Tw=     2.00000000
+              ck=     1.00000000         gamma=     1.66666667            Pr=     0.66666667
+           omega=     0.50000000           Tcm=     0.40440000
+      Nstep_show=            100   Nstep_write=            100
+             CFL= 0.10000000E+00           EPS= 0.10000000E-11     dt_global= 0.25000000E-03
+          Nx_all=              8        Ny_all=             64            Nu=             32            Nv=             32
+            NP_X=              1          NP_Y=              8
+           U_MIN=   -16.05137466         U_MAX=    16.05137466         V_MIN=   -16.05137466         V_MAX=    16.05137466
+                flag_vislaw  =  PowerLaw                      
+            TimeStep_method  =  Time_global_varying           
+     TimeIntegration_method  =               HighOrderImplicit
+              Implicit_nCFL  =   1.00000000E+03
+       Implicit_MacroSweeps  =         2     Implicit_MicroSweeps  =         1
+       Implicit_ResidualTol  =   1.00000000E-08       Implicit_MomentTol  =   1.00000000E-12        Implicit_MinAlpha  =   1.00000000E-06
+        Implicit_MaxRetries  =         0         Implicit_MaxIter  =         2
+             Unsteady_Theta  =   5.00000000E-01        Unsteady_InnerTol  =   1.00000000E-08        Unsteady_MaxInner  =        50
+      Reconstruction_method  =                 Reconst_Vanleer
+          Quadrature_method  =  Quad_GaussHermite             
+             Iflag_InitFlow  =  Init_Freestream               
+-------------------------------Boundary information------------------------------
+                BG_geometry  =  BGconst_General               
+              FluxWall_type  =  FluxWall_Multiscale           
+                 Acc coeff.  =       1.00000000
+                  Left B.C.  =  Periodic                      
+                 Right B.C.  =  Periodic                      
+                Bottom B.C.  =  Wall_isothermal               
+                 Upper B.C.  =  Wall_isothermal               
+-------------------------------Disturbance information------------------------------
+             Iflag_unsteady  =  No                            
+               Iflag_fringe  =  No                            
+                 DISBC_Type  =  None                          
+--------------------------------------------------------------------------------
+S2 effective wall T_native:   2.0000000000000000E+00  2.0000000000000000E+00
+S2 effective wall theta:   1.0000000000000000E+00  1.0000000000000000E+00
+S2 effective wall lambda:   5.0000000000000000E-01  5.0000000000000000E-01
+S2 native block rank=7 origin=     1    57 cells=     8     8
+S2 native block rank=6 origin=     1    49 cells=     8     8
+S2 native block rank=5 origin=     1    41 cells=     8     8
+S2 native block rank=0 origin=     1     1 cells=     8     8
+S2 native block rank=3 origin=     1    25 cells=     8     8
+S2 native block rank=1 origin=     1     9 cells=     8     8
+S2 native block rank=2 origin=     1    17 cells=     8     8
+S2 native block rank=4 origin=     1    33 cells=     8     8
+persistent_M0=  1.0000000000000000E+000
+Implicit iter=2 nCFL=  1.0000E+03 alpha=  1.0000E+00 Rrho=  1.0033E+00 RrhoU=  7.8470E+01 RrhoV=  7.3387E+01 RE=  1.0802E+01 Rh=  4.4081E-01 Rb=  5.3786E-01 moment=  3.4389E-15 mass=  2.7105E-19 wall=  9.7605E-01 retries=0 retryTotal=0
+WARNING: HighOrderImplicit reached iteration limit at 2 with max residual   7.84700946E+01

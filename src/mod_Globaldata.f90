@@ -15,14 +15,15 @@
     !>Define the global constant parameters
     !--------------------------------------------------
     module const_para
+        use, intrinsic :: iso_fortran_env, only: real32
         use Precision
         implicit none
     
         integer(KINT),parameter             :: GHOST = 2                !Ghost cell number: applied to physical boundary
     
-        real(KREAL), parameter              :: PI   = 4.0*atan(1.0)     !Pi
-        real(KREAL), parameter              :: bz   = 1.3806488E-23     !Boltzmann constant
-        real(KREAL), parameter              :: SMV  = tiny(0.0)         !Small value to avoid 0/0
+        real(KREAL), parameter              :: PI   = 4.0_KREAL * atan(1.0_KREAL)     !Pi
+        real(KREAL), parameter              :: bz   = 1.3806488E-23_KREAL     !Boltzmann constant
+        real(KREAL), parameter              :: SMV  = real(tiny(0.0_real32), KREAL)         !Small value to avoid 0/0
         real(KREAL), parameter              :: UP   = 1.0               !Used in sign() function
         
         !Initialize flow
@@ -157,6 +158,9 @@
         integer(KINT)                       :: iter                     !Current iteration
         integer(KINT)                       :: max_iter                 !Maximal iterations
         integer(KINT)                       :: Nstep_show               !Show residuals every Nstep_show step
+        integer(KINT) :: Nstep_restart=100 ! Latest complete restart; 0=terminal only
+        integer(KINT) :: Nstep_audit=0     ! Historical state/restart/profile snapshots; 0=off
+        integer(KINT) :: Nstep_monitor=1   ! Accepted-state scalar residual log cadence
         integer(KINT)                       :: Nstep_write              !Write files every Nstep_write step
         real(KREAL)                         :: res(4)                   !Global L2-normalized residual
         real(KREAL)                         :: res_relative(4)          !Relative residual before zero-scale selection
@@ -174,9 +178,12 @@
     contains
 
         pure logical function IsImplicitSteady()
-            IsImplicitSteady = trim(adjustl(TimeIntegration_method)) == 'ImplicitSteady'
+            IsImplicitSteady = trim(adjustl(TimeIntegration_method)) == 'ImplicitSteady'.or.IsHighOrderImplicit()
         end function IsImplicitSteady
 
+        pure logical function IsHighOrderImplicit()
+            IsHighOrderImplicit=trim(adjustl(TimeIntegration_method))=='HighOrderImplicit'
+        end function
         pure logical function IsS2Steady()
             IsS2Steady = trim(adjustl(TimeIntegration_method)) == 'S2Steady'
         end function IsS2Steady
@@ -204,6 +211,8 @@
         real(KREAL)                         :: Kn                       !Knudsen number (mean free path is defined by mu/rho*sqrt(pi/(2RT)))
     
         !Gas properties
+        integer(KINT) :: S2PhysicalGas = 0 ! opt-in physical model; legacy fixed CK1 remains default
+        real(KREAL) :: S2_mu_ref = 0.1_KREAL ! viscosity at solver temperature T=1 (theta=1/2)
         integer(KINT)                       :: ck                       !Internal degree of freedom, here 1 denotes 2D flow for monatomic gas
         real(KREAL)                         :: Pr                       !Prandtl number
         integer(KINT)                       :: flag_vislaw              !Viscous law
@@ -222,12 +231,41 @@
         !Free-stream or wall state: density, u, v, lambda=1/T  
         real(KREAL)                         :: Prim_inf(4)              !Free-stream gas
         real(KREAL)                         :: Prim_wall(4)             !Wall condition
+        integer(KINT)                       :: S2W1_wall_mode           !0: frozen periodic; 1: flat y diffuse wall
+        integer(KINT)                       :: S2W2R_shared_predictor !0 frozen W2, 1 shared explicit L predictor
+        integer(KINT)                       :: S2W1_time_centered       !0: W1 old-time wall; 1: midpoint predicted wall
+        integer(KINT)                       :: S2W1D_face_time_consistent !0: original UGKS; 1: discrete dt^2 face correction
+        real(KREAL)                         :: S2W1_wall_ux(2),S2W1_wall_theta(2)
+
+        ! Native S2 configuration. Blank table / negative scale preserve legacy env fallback.
+        character(len=16) :: S2VelocityTable=''
+        real(KREAL) :: S2VelocityScale=-1.0_KREAL
+        logical :: S2CartesianMesh=.false.,S2Diagnostics=.false.
+        real(KREAL) :: S2WallTNative(2)=-huge(1.0_KREAL)
+        character(len=1024) :: S2CheckpointImport=''
 
         !Boundary conditio
-        integer(KINT)                       :: BC_Type(4)               !Boundary conditions         
+        integer(KINT)                       :: BC_Type(4) ! Boundary conditions
         integer(KINT)                       :: BG_geometry              !0: general, 1:flat plate
         real(KREAL)                         :: ACC                      !Accommodation coefficient at the solid wall 
     
+        ! Optional Couette inputs. Defaults preserve the original stationary-wall path.
+        real(KREAL) :: CouetteMuRef = -1.0_KREAL
+        real(KREAL) :: WallUx(4) = 0.0_KREAL
+        character(len=256) :: StructuredVelocityFile = ''
+        logical :: CouetteUseW2BWall = .false.
+        logical :: Implicit_ClosedMassConstraint = .false.
+        logical :: Implicit_ZhuMovingWall = .false.
+        logical :: Implicit_InitHaloResync = .false.
+        logical :: ClosedCouetteMassRescale = .false.
+        logical :: UnifiedPhysicalOperators=.false.
+    contains
+        function WallPrimary(side) result(p)
+            integer, intent(in) :: side
+            real(KREAL) :: p(4)
+            p=Prim_wall
+            p(2)=WallUx(side)
+        end function WallPrimary
     end module flow_para
     
     

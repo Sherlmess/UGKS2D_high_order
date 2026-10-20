@@ -1,4 +1,6 @@
 module ImportPara
+    use mod_S2MPI1Layout, only: slab_enabled
+    use mod_VelocityTables, only: VelocityMode,VelocityCount,VelocityMax
     use flow_para
     use control_para
     use tools
@@ -20,6 +22,11 @@ contains
         implicit none
         logical :: ext1
 
+        block
+            character(len=8)::mpi1_flag
+            call get_environment_variable("S2_MPI1",mpi1_flag)
+            slab_enabled=trim(mpi1_flag)=="1"
+        end block
         call Set_default_parameters
 
         if (myid == 0) then
@@ -28,7 +35,7 @@ contains
                 call ReadParameters
             else
                 print *, "Can not find 'Config.ini', stop !"
-                stop
+                call MPI_Abort(MPI_COMM_WORLD,472,ierr)
             endif
         endif
 
@@ -51,7 +58,7 @@ contains
         Tw = 0.d0
 
         ck = 1
-        Pr = 2.0 / 3.0
+        Pr = 2.0_KREAL / 3.0_KREAL
         flag_vislaw = PowerLaw
         omega = 0.5
         Tcm = 0.4044
@@ -61,6 +68,9 @@ contains
         EPS = 1.0E-7
         Nstep_show = 10
         Nstep_write = 10000
+        Nstep_restart=100
+        Nstep_audit=0
+        Nstep_monitor=1
         Quadrature_method = Quad_NewtonCotes4
         TimeStep_method = Time_global_varying
         Iflag_InitFlow = Init_Freestream
@@ -75,6 +85,14 @@ contains
         ComparisonFaceTauCalls=0
         ComparisonCellTauCalls=0
         S2D1_initial_mode = 0
+        S2PhysicalGas = 0
+        S2_mu_ref = 0.1_KREAL
+        S2W1_wall_mode = 0
+        S2W2R_shared_predictor = 0
+        S2W1_time_centered = 0
+        S2W1D_face_time_consistent = 0
+        S2W1_wall_ux = 0.0_KREAL
+        S2W1_wall_theta = -huge(1.0_KREAL) ! omitted per-side override
         Implicit_nCFL = 100.0_KREAL
         Implicit_MacroSweeps = 2
         Implicit_MicroSweeps = 1
@@ -88,6 +106,7 @@ contains
         Unsteady_MaxInner = 50
         simTime = 0.0
         iter = 0
+        time_dis=0.0_KREAL
         dt_global = 1.0E-6
         res(4) = 0.0
 
@@ -122,21 +141,162 @@ contains
     subroutine ReadBaseParameters()
         namelist /config_para/ Ma, Re, AOA, Tinf, Tw, &
                           ck, Pr, flag_vislaw, omega, Tcm, &
-                          dt_global, CFL, Nstep_show, Nstep_write, EPS, MAX_ITER, &
+                          dt_global, CFL, Nstep_show, Nstep_write, Nstep_restart, Nstep_audit, Nstep_monitor, EPS, MAX_ITER, &
                           Quadrature_method, TimeStep_method, TimeIntegration_method, PeriodicComparisonProfile, &
                           Implicit_nCFL, Implicit_MacroSweeps, Implicit_MicroSweeps, &
                           Implicit_ResidualTol, Implicit_MomentTol, Implicit_MinAlpha, &
-                          Implicit_MaxRetries, Implicit_MaxIter, &
+                          Implicit_MaxRetries, Implicit_MaxIter, UnifiedPhysicalOperators, &
+                          CouetteMuRef,StructuredVelocityFile,Implicit_ClosedMassConstraint, &
+                          Implicit_ZhuMovingWall,Implicit_InitHaloResync,ClosedCouetteMassRescale, &
                           Unsteady_Theta, Unsteady_InnerTol, Unsteady_MaxInner, &
                           Iflag_InitFlow, Iflag_WriteSurf, Iflag_WriteRestart, S2D1_initial_mode, &
+                          S2W1_wall_mode,S2W1_time_centered,S2W1D_face_time_consistent,S2W2R_shared_predictor, &
+                          S2W1_wall_ux,S2W1_wall_theta,S2PhysicalGas,S2_mu_ref, &
+                          S2WallTNative,S2VelocityTable,S2VelocityScale,S2CartesianMesh,S2Diagnostics,S2CheckpointImport, &
                           Nx_all, Ny_all, Nu, Nv, U_MIN, U_MAX, V_MIN, V_MAX, NP_X, NP_Y
-        namelist /boundary_para/ BC_Type, BG_geometry, FluxWall_type, ACC
+        namelist /boundary_para/ BC_Type, BG_geometry, FluxWall_type, ACC, WallUx, CouetteUseW2BWall
 
+        call CheckDuplicateS2Walls()
         open(1, file="Config.ini")
-        read(1, nml=config_para)
-        read(1, nml=boundary_para)
+        read(1, nml=config_para,iostat=ierr)
+        if(ierr/=0)call AbortInvalidImplicitOption('Config.ini config namelist parse failure')
+        read(1, nml=boundary_para,iostat=ierr)
+        if(ierr/=0)call AbortInvalidImplicitOption('Config.ini boundary namelist parse failure')
         close(1)
+        if(UnifiedPhysicalOperators)then
+            S2_mu_ref=CouetteMuRef
+            S2W1_wall_ux=WallUx(3:4)
+        endif
+        if(Nstep_show<1.or.Nstep_write<1.or.Nstep_restart<0.or.Nstep_audit<0.or.Nstep_monitor<1) &
+            call AbortInvalidImplicitOption('invalid output frequency in Config.ini')
+        call ResolveS2WallTemperatures()
     end subroutine ReadBaseParameters
+
+    subroutine CheckDuplicateS2Walls()
+        character(len=4096)::line
+        character(len=:),allocatable::text,key
+        real(KREAL)::seen(2),values(2),tn
+        integer::fu,ios,p,a,z,v,q,side,last_z,last_kind
+        logical::in_config
+        namelist /wall_check/ values
+        text='';in_config=.false.
+        open(newunit=fu,file='Config.ini',status='old')
+        do
+            read(fu,'(A)',iostat=ios)line
+            if(ios/=0)exit
+            q=0
+            do p=1,len_trim(line)
+                if(q==0.and.(line(p:p)=="'".or.line(p:p)=='"'))then
+                    q=iachar(line(p:p))
+                elseif(q/=0.and.iachar(line(p:p))==q)then
+                    q=0
+                elseif(q==0.and.line(p:p)=='!')then
+                    line=line(:p-1);exit
+                endif
+            enddo
+            if(index(LowerS2(line),'&config_para')>0)in_config=.true.
+            if(in_config)text=text//' '//trim(line)
+            if(in_config.and.trim(adjustl(line))=='/')exit
+        enddo
+        close(fu)
+        seen=-huge(1.0_KREAL);p=1;last_z=0;last_kind=0;q=0
+        do while(p<=len(text))
+            if(q==0.and.(text(p:p)=="'".or.text(p:p)=='"'))then
+                q=iachar(text(p:p));p=p+1;cycle
+            elseif(q/=0)then
+                if(iachar(text(p:p))==q)q=0
+                p=p+1;cycle
+            endif
+            if(text(p:p)=='/')exit
+            if(index('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_',text(p:p))==0)then
+                p=p+1;cycle
+            endif
+            a=p
+            do while(p<=len(text))
+                if(index('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789',text(p:p))==0)exit
+                p=p+1
+            enddo
+            z=p-1;key=LowerS2(text(a:z))
+            do while(p<=len(text))
+                if(text(p:p)/=' '.and.iachar(text(p:p))/=9)exit
+                p=p+1
+            enddo
+            if(p<=len(text))then
+                if(text(p:p)=='(')then
+                    v=index(text(p:),')');if(v==0)exit
+                    p=p+v
+                    do while(p<=len(text))
+                        if(text(p:p)/=' ')exit
+                        p=p+1
+                    enddo
+                endif
+            endif
+            if(p>len(text))exit
+            if(text(p:p)/='=')cycle
+            if(last_kind/=0)call CheckAssignment(text(last_z+1:a-1),last_kind)
+            last_z=z;last_kind=0
+            if(key=='s2walltnative')last_kind=1
+            if(key=='s2w1_wall_theta')last_kind=2
+            p=p+1
+        enddo
+        if(last_kind/=0)call CheckAssignment(text(last_z+1:p-1),last_kind)
+    contains
+        subroutine CheckAssignment(tail,which)
+            character(len=*),intent(in)::tail
+            integer,intent(in)::which
+            character(len=:),allocatable::nml
+            values=-huge(1.0_KREAL)
+            nml='&wall_check values'//tail//' /'
+            read(nml,nml=wall_check,iostat=ios)
+            if(ios/=0)call AbortInvalidImplicitOption('cannot parse S2 wall temperature assignment')
+            do side=1,2
+                if(values(side)==-huge(1.0_KREAL))cycle
+                tn=values(side);if(which==2)tn=2.0_KREAL*tn
+                if(seen(side)/=-huge(1.0_KREAL))then
+                    if(abs(tn-seen(side))>8.0_KREAL*epsilon(tn)*max(abs(tn),abs(seen(side)))) &
+                        call AbortInvalidImplicitOption('repeated same-side S2 wall temperature assignment disagrees')
+                endif
+                seen(side)=tn
+            enddo
+        end subroutine
+    end subroutine
+    function LowerS2(text) result(lower)
+        character(len=*),intent(in)::text
+        character(len=len(text))::lower
+        integer::i,n
+        lower=text
+        do i=1,len(text)
+            n=iachar(text(i:i))
+            if(n>=iachar('A').and.n<=iachar('Z'))lower(i:i)=achar(n+32)
+        enddo
+    end function
+
+    subroutine ResolveS2WallTemperatures()
+        integer :: side
+        logical :: has_theta,has_native
+        real(KREAL) :: tn
+        do side=1,2
+            has_theta=S2W1_wall_theta(side)/=-huge(1.0_KREAL)
+            has_native=S2WallTNative(side)/=-huge(1.0_KREAL)
+            if(has_theta.and.has_native)then
+                if(abs(S2WallTNative(side)-2.0_KREAL*S2W1_wall_theta(side))> &
+                    8.0_KREAL*epsilon(tn)*max(abs(S2WallTNative(side)),abs(2.0_KREAL*S2W1_wall_theta(side)))) &
+                    call AbortInvalidImplicitOption('same-side S2WallTNative and S2W1_wall_theta disagree')
+            endif
+            tn=Tw
+            if(has_theta)tn=2.0_KREAL*S2W1_wall_theta(side)
+            if(has_native)tn=S2WallTNative(side)
+            if(S2W1_wall_mode==1)then
+                if(.not.ieee_is_finite(tn).or.tn<=0.0_KREAL) &
+                    call AbortInvalidImplicitOption('effective S2 wall T_native must be positive and finite')
+            elseif(.not.has_theta.and..not.has_native)then
+                tn=2.0_KREAL ! unused legacy periodic defaults
+            endif
+            S2WallTNative(side)=tn;S2W1_wall_theta(side)=0.5_KREAL*tn
+            if(S2W1_wall_mode==1)write(*,'(A,I0,A,3ES24.16)') &
+                'S2 wall side ',side,' T_native, theta, lambda: ',tn,0.5_KREAL*tn,1.0_KREAL/tn
+        enddo
+    end subroutine ResolveS2WallTemperatures
 
     subroutine ReadDISParameters()
         integer(KINT) :: i
@@ -208,6 +368,63 @@ contains
 
     subroutine ValidateSupportedOptions()
         integer(KINT) :: boundary_index
+        integer::rect_status
+        character(len=8)::rect_flag
+        logical::rect_enabled
+        if(IsHighOrderImplicit().and..not.UnifiedPhysicalOperators) &
+            call AbortInvalidImplicitOption('HighOrderImplicit requires UnifiedPhysicalOperators')
+        if(IsHighOrderImplicit())then
+            if(.not.ieee_is_finite(Implicit_nCFL).or.Implicit_nCFL<=0.0_KREAL.or. &
+                .not.ieee_is_finite(Implicit_ResidualTol).or.Implicit_ResidualTol<=0.0_KREAL.or. &
+                .not.ieee_is_finite(Implicit_MomentTol).or.Implicit_MomentTol<=0.0_KREAL.or. &
+                .not.ieee_is_finite(Implicit_MinAlpha).or.Implicit_MinAlpha<=0.0_KREAL.or. &
+                Implicit_MinAlpha>1.0_KREAL.or.Implicit_MaxIter<1) &
+                call AbortInvalidImplicitOption('invalid high-order implicit tolerance, CFL or iteration limit')
+        endif
+        if(UnifiedPhysicalOperators)then
+            if(TimeStep_method/=Time_global_varying) &
+                call AbortInvalidImplicitOption('shared physical operators require global physical CFL')
+            if(.not.ieee_is_finite(CouetteMuRef).or.CouetteMuRef<=0) &
+                call AbortInvalidImplicitOption('shared operators require positive viscosity')
+            if(IsHighOrderImplicit().and.(Implicit_MacroSweeps/=2.or.Implicit_MicroSweeps/=1.or.Implicit_MaxRetries/=0)) &
+                call AbortInvalidImplicitOption('HighOrderImplicit requires PR2, one micro pair, no retry')
+        endif
+        if(ClosedCouetteMassRescale)then
+            if(.not.IsImplicitSteady().or.any(BC_Type/=[10,10,2,2]).or.BG_geometry/=0.or. &
+                .not.CouetteUseW2BWall.or.FluxWall_type/=1.or.ACC/=1.or.Iflag_DIS/=0.or. &
+                Iflag_Fringe/=0.or.DISBC_Type/=0.or.Implicit_ClosedMassConstraint) &
+                call AbortInvalidImplicitOption('mass rescale only for closed periodic Couette implicit')
+        endif
+        if(S2VelocityScale/=-1.0_KREAL)then
+            if(.not.ieee_is_finite(S2VelocityScale).or.S2VelocityScale<=0.0_KREAL) &
+                call AbortInvalidImplicitOption('S2VelocityScale must be positive and finite')
+            if(VelocityMode()=='full16'.and.S2VelocityScale/=1.0_KREAL) &
+                call AbortInvalidImplicitOption('full16 keeps its original scale 1 velocity table')
+        endif
+        if(slab_enabled)then
+            if(NP_X/=1.or.all(NP_Y/=[1,2,4]).or.Nx_all/=8.or.all(Ny_all/=[32,64]).or. &
+                (trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or.FluxWall_type/=1.or.S2W1_wall_mode/=1.or. &
+                VelocityMode()/='half32'.or.S2PhysicalGas/=1.or.ck/=1.or. &
+                abs(Pr-2.0_KREAL/3.0_KREAL)>epsilon(Pr).or.trim(PeriodicComparisonProfile)/='Off')call AbortInvalidImplicitOption('MPI1 scope violation')
+        endif
+        if(S2PhysicalGas/=0.and.S2PhysicalGas/=1)call AbortInvalidImplicitOption('S2PhysicalGas must be 0 or 1')
+        if(S2PhysicalGas==1.and.(trim(TimeIntegration_method)=='S2CN2'.or.IsHighOrderImplicit()))then
+            if((trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or.(S2W1_wall_mode==1.and.FluxWall_type/=1).or. &
+                S2W2R_shared_predictor/=0.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0.or. &
+                all(ck/=[1,3]))call AbortInvalidImplicitOption('physical gas requires W2 type1 single-rank CK1/3')
+            if(.not.ieee_is_finite(Pr).or.Pr<=0.0_KREAL.or.Pr>1.0_KREAL.or. &
+                .not.ieee_is_finite(S2_mu_ref).or.S2_mu_ref<=0.0_KREAL.or. &
+                .not.ieee_is_finite(omega).or..not.ieee_is_finite(Tcm).or.Tcm<0.0_KREAL.or. &
+                all(flag_vislaw/=[PowerLaw,Sutherland]))call AbortInvalidImplicitOption('invalid physical transport parameters')
+        endif
+        if(VelocityMode()/='full16'.and.(trim(TimeIntegration_method)=='S2CN2'.or.IsHighOrderImplicit().or..not.UnifiedPhysicalOperators))then
+            if(Nu/=VelocityCount().or.Nv/=VelocityCount().or.(S2PhysicalGas==0.and.(ck/=1.or.Pr/=1.0_KREAL)).or. &
+                Quadrature_method/=Quad_GaussHermite.or.FluxWall_type/=1.or.(S2W1_wall_mode==1.and.any(BC_Type/=[10,10,2,2])).or. &
+                Iflag_DIS/=0.or.Iflag_Fringe/=0.or.(trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or. &
+                S2W2R_shared_predictor/=0.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0) &
+                call AbortInvalidImplicitOption('new velocity tables require approved single-rank flat BGK range')
+        endif
+
 
         if(trim(adjustl(PeriodicComparisonProfile))/='Off'.and. &
            trim(adjustl(PeriodicComparisonProfile))/='BGK_ConstTau') &
@@ -221,7 +438,7 @@ contains
             if(Quadrature_method/=Quad_GaussHermite.or.Nu/=16.or.Nv/=16.or.ck/=1.or. &
                abs(Pr-1.0_KREAL)>epsilon(Pr)) &
                 call AbortInvalidImplicitOption('BGK_ConstTau requires BGK CK1 frozen GH16xGH16')
-            if(TimeStep_method/=Time_global_fixed.or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
+            if((TimeStep_method/=Time_global_fixed.and..not.UnifiedPhysicalOperators).or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
                 call AbortInvalidImplicitOption('BGK_ConstTau requires positive fixed dt')
             if(any(BC_Type/=BCconst_periodic).or.Iflag_DIS/=0.or.Iflag_Fringe/=0) &
                 call AbortInvalidImplicitOption('BGK_ConstTau requires double periodic and DIS/fringe off')
@@ -231,11 +448,28 @@ contains
         endif
 
         select case (trim(adjustl(TimeIntegration_method)))
-        case ('Explicit', 'ImplicitSteady', 'ImplicitUnsteady', 'S2D1', 'S2D1VL', 'S2CN2', 'S2Steady')
+        case ('Explicit', 'ImplicitSteady', 'ImplicitUnsteady', 'S2D1', 'S2D1VL', 'S2CN2', 'S2Steady','HighOrderImplicit')
         case default
             call AbortInvalidImplicitOption('TimeIntegration_method is unsupported')
         end select
+        if(S2W1_wall_mode/=0.and.(trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).and..not.UnifiedPhysicalOperators) &
+            call AbortInvalidImplicitOption('S2W1 wall mode requires S2CN2')
+        if(S2W1_time_centered<0.or.S2W1_time_centered>1) &
+            call AbortInvalidImplicitOption('S2W1_time_centered must be 0 or 1')
+        if(S2W1_time_centered==1.and.S2W1_wall_mode/=1) &
+            call AbortInvalidImplicitOption('S2W1 midpoint time option requires the flat wall')
+        if(S2W1D_face_time_consistent<0.or.S2W1D_face_time_consistent>1) &
+            call AbortInvalidImplicitOption('S2W1D_face_time_consistent must be 0 or 1')
+        if(S2W1D_face_time_consistent==1.and.(S2W1_wall_mode/=1.or.S2W1_time_centered/=1)) &
+            call AbortInvalidImplicitOption('S2W1D face correction requires W1T midpoint wall')
 
+        if(S2W2R_shared_predictor<0.or.S2W2R_shared_predictor>1) &
+            call AbortInvalidImplicitOption('S2W2R_shared_predictor must be 0 or 1')
+        if(S2W2R_shared_predictor==1)then
+            if((trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).or.S2W1_wall_mode/=1.or.FluxWall_type/=1.or. &
+                ck/=1.or.Pr/=1.0_KREAL.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0.or. &
+                NP_X/=1.or.NP_Y/=1)call AbortInvalidImplicitOption('W2R supports only frozen flat type1 BGK setup')
+        endif
         select case (Quadrature_method)
         case (Quad_NewtonCotes4, Quad_GaussHermite, Quad_Unstruct)
         case default
@@ -257,21 +491,55 @@ contains
                 call AbortInvalidImplicitOption('FluxWall_Maxwell is unsupported for the selected time integration method')
         endif
 
-        if(trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsS2Steady()) then
-            if(NP_X/=1.or.NP_Y/=1) call AbortInvalidImplicitOption('S2CN2 requires NP_X=NP_Y=1')
-            if(Nx_all/=Ny_all.or.all(Nx_all/=[8,16,32,64])) &
+        if((trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsHighOrderImplicit()).or.IsS2Steady()) then
+            if(NP_X<1.or.NP_Y<1)call AbortInvalidImplicitOption('S2CN2 requires positive NP_X/NP_Y')
+            if(IsS2Steady())then
+            rect_flag='';call get_environment_variable('S2_RECT_WALL',rect_flag,status=rect_status)
+            rect_enabled=S2CartesianMesh.or.(rect_status==0.and.trim(rect_flag)=='1')
+            if(Nx_all/=Ny_all)then
+                if(.not.rect_enabled.or.all(Nx_all/=[8,16]).or.all(Ny_all/=[16,32,64]).or. &
+                    (trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).or.S2W1_wall_mode/=1.or. &
+                    FluxWall_type/=1.or.S2W2R_shared_predictor/=0.or.S2W1_time_centered/=0.or. &
+                    S2W1D_face_time_consistent/=0.or.(S2PhysicalGas==0.and.abs(Pr-1.0_KREAL)>epsilon(Pr))) &
+                    call AbortInvalidImplicitOption('rectangle requires enabled W2 type1 Nx8/16 Ny16/32/64 BGK')
+            elseif(all(Nx_all/=[8,16,32,64]))then
                 call AbortInvalidImplicitOption('S2CN2 requires N8/N16/N32/N64 square mesh')
-            if(Quadrature_method/=Quad_GaussHermite.or.Nu/=16.or.Nv/=16) &
-                call AbortInvalidImplicitOption('S2CN2 requires the frozen GH16xGH16 velocity rule')
-            if(ck/=1) call AbortInvalidImplicitOption('S2CN2 requires CK=1')
-            if(abs(Pr-1.0_KREAL)>epsilon(Pr).and.abs(Pr-2.0_KREAL/3.0_KREAL)>epsilon(Pr)) &
+            endif
+            endif
+            if(Quadrature_method/=Quad_GaussHermite.or.Nu/=VelocityCount().or.Nv/=VelocityCount()) &
+                call AbortInvalidImplicitOption('S2CN2 velocity count disagrees with selected table')
+            if(ck/=1.and.S2PhysicalGas==0) call AbortInvalidImplicitOption('S2CN2 legacy requires CK=1')
+            if(S2PhysicalGas==0.and.abs(Pr-1.0_KREAL)>epsilon(Pr).and.abs(Pr-2.0_KREAL/3.0_KREAL)>epsilon(Pr)) &
                 call AbortInvalidImplicitOption('S2CN2 supports only Pr=1 or Pr=2/3 in this package')
-            if(TimeStep_method/=Time_global_fixed.or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
+            if((TimeStep_method/=Time_global_fixed.and..not.UnifiedPhysicalOperators).or..not.ieee_is_finite(dt_global).or.dt_global<=0.0_KREAL) &
                 call AbortInvalidImplicitOption('S2CN2 requires positive fixed dt_global')
-            if(any(BC_Type/=BCconst_periodic)) call AbortInvalidImplicitOption('S2CN2 requires four periodic boundaries')
+            if(S2W1_wall_mode==0)then
+                if(any(BC_Type/=BCconst_periodic)) call AbortInvalidImplicitOption('S2CN2 requires four periodic boundaries')
+            elseif(S2W1_wall_mode==1.and.(trim(adjustl(TimeIntegration_method))=='S2CN2'.or.IsHighOrderImplicit()))then
+                if(any(BC_Type(1:2)/=BCconst_periodic).or.any(BC_Type(3:4)/=BCconst_wall_isothermal)) &
+                    call AbortInvalidImplicitOption('S2W1 requires x periodic and two y isothermal walls')
+                if((FluxWall_type/=FluxWall_Kinetic.and.FluxWall_type/=FluxWall_Multiscale).or. &
+                    (S2PhysicalGas==0.and.abs(Pr-1.0_KREAL)>epsilon(Pr)).or. &
+                    any(S2W1_wall_theta<=0.0_KREAL).or..not.all(ieee_is_finite(S2W1_wall_theta)).or. &
+                    .not.all(ieee_is_finite(S2W1_wall_ux))) &
+                    call AbortInvalidImplicitOption('S2 flat walls require kinetic/multiscale BGK and finite wall state')
+                if(FluxWall_type==FluxWall_Multiscale.and. &
+                    (S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0)) &
+                    call AbortInvalidImplicitOption('S2W2 type1 requires centered=0 and face_time_consistent=0')
+            else
+                call AbortInvalidImplicitOption('S2W1 wall mode is unsupported for this method')
+            endif
             if(Iflag_DIS/=0.or.Iflag_Fringe/=0) call AbortInvalidImplicitOption('S2CN2 does not support DIS/fringe')
-            if(S2D1_initial_mode/=0.and.S2D1_initial_mode/=3) &
-                call AbortInvalidImplicitOption('S2CN2 supports initial modes 0 and 3 only')
+            if(.not.IsS2Steady())then
+                ! Native S2 cold/restart initialization is selected by Iflag_InitFlow.
+                continue
+            elseif(S2W1_wall_mode==1)then
+                if(S2D1_initial_mode/=4.and.S2D1_initial_mode/=5) &
+                    call AbortInvalidImplicitOption('S2W1 requires initial mode 4 or 5')
+            else
+                if(S2D1_initial_mode/=0.and.S2D1_initial_mode/=3) &
+                    call AbortInvalidImplicitOption('S2CN2 supports initial modes 0 and 3 only')
+            endif
             if(MAX_ITER<1) call AbortInvalidImplicitOption('S2CN2 requires MAX_ITER>=1')
             if(IsS2Steady())then
                 if(Nx_all/=8.or.abs(Pr-1.0_KREAL)>epsilon(Pr)) &
@@ -328,7 +596,7 @@ contains
 
         do boundary_index = 1, size(BC_Type)
             select case (BC_Type(boundary_index))
-            case (BCconst_wall_isothermal, BCconst_symmetry, BCconst_freestream, BCconst_extrapolation)
+            case (BCconst_wall_isothermal, BCconst_symmetry, BCconst_freestream, BCconst_extrapolation,BCconst_periodic)
             case default
                 call AbortInvalidImplicitOption('boundary types must be 2, 3, 4, or 6')
             end select
@@ -366,8 +634,26 @@ contains
         call MPI_Bcast(PeriodicComparisonProfile, len(PeriodicComparisonProfile), MPI_CHARACTER, 0, MPI_COMM_WORLD, ierr)
         Ipara = int(Ipara_real, KINT)
 
+        call MPI_Bcast(CouetteMuRef,1,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(CouetteUseW2BWall,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(Implicit_ClosedMassConstraint,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(Implicit_ZhuMovingWall,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(Implicit_InitHaloResync,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(ClosedCouetteMassRescale,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(WallUx,4,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(StructuredVelocityFile,len(StructuredVelocityFile),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(UnifiedPhysicalOperators,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(Nstep_restart,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(Nstep_audit,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(Nstep_monitor,1,MPI_INTEGER,0,MPI_COMM_WORLD,ierr)
         call UnpackIntegerParameters(Ipara)
         call UnpackRealParameters(Rpara)
+        call MPI_Bcast(S2VelocityTable,len(S2VelocityTable),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(S2VelocityScale,1,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(S2WallTNative,2,MPI_KREAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(S2CartesianMesh,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(S2Diagnostics,1,MPI_LOGICAL,0,MPI_COMM_WORLD,ierr)
+        call MPI_Bcast(S2CheckpointImport,len(S2CheckpointImport),MPI_CHARACTER,0,MPI_COMM_WORLD,ierr)
     end subroutine bcast_para
 
     subroutine PackIntegerParameters(Ipara)
@@ -399,6 +685,11 @@ contains
         Ipara(28) = Implicit_MaxIter
         Ipara(29) = Unsteady_MaxInner
         Ipara(30) = S2D1_initial_mode
+        Ipara(31) = S2W1_wall_mode
+        Ipara(32) = S2W1_time_centered
+        Ipara(33) = S2W1D_face_time_consistent
+        Ipara(34) = S2W2R_shared_predictor
+        Ipara(35) = S2PhysicalGas
         Ipara(40) = Iflag_DIS
         Ipara(41) = DISBC_Type
         Ipara(42) = Iflag_Fringe
@@ -445,6 +736,9 @@ contains
         Rpara(20) = Implicit_MinAlpha
         Rpara(21) = Unsteady_Theta
         Rpara(22) = Unsteady_InnerTol
+        Rpara(23:24) = S2W1_wall_ux
+        Rpara(25:26) = S2W1_wall_theta
+        Rpara(27) = S2_mu_ref
 
         if (Iflag_DIS == 1) then
             is = 40
@@ -498,6 +792,11 @@ contains
         Implicit_MaxIter = Ipara(28)
         Unsteady_MaxInner = Ipara(29)
         S2D1_initial_mode = Ipara(30)
+        S2W1_wall_mode = Ipara(31)
+        S2W1_time_centered = Ipara(32)
+        S2W1D_face_time_consistent = Ipara(33)
+        S2W2R_shared_predictor = Ipara(34)
+        S2PhysicalGas = Ipara(35)
         Iflag_DIS = Ipara(40)
         DISBC_Type = Ipara(41)
         Iflag_Fringe = Ipara(42)
@@ -545,6 +844,9 @@ contains
         Implicit_MinAlpha = Rpara(20)
         Unsteady_Theta = Rpara(21)
         Unsteady_InnerTol = Rpara(22)
+        S2W1_wall_ux = Rpara(23:24)
+        S2W1_wall_theta = Rpara(25:26)
+        S2_mu_ref = Rpara(27)
 
         if (Iflag_DIS == 1) then
             is = 40
@@ -614,7 +916,15 @@ contains
 
         mu_ref = sqrt(gamma / 2.d0) * Ma / Re
         Kn = sqrt(pi * gamma / 2.d0) * Ma / Re
+        if(S2PhysicalGas==1)then
+            mu_ref=S2_mu_ref
+            Kn=sqrt(pi)*mu_ref
+        endif
 
+
+        if(CouetteMuRef>0)then
+            mu_ref=CouetteMuRef;Kn=sqrt(PI)*mu_ref
+        endif
         Vinf = Ma * sqrt(gamma / 2.d0)
         uf = Vinf * cosd(AOA)
         vf = Vinf * sind(AOA)
@@ -622,12 +932,24 @@ contains
 
         Prim_wall = [1.d0, 0.d0, 0.d0, 1.d0 / Tw]
 
+        if(S2W2R_shared_predictor<0.or.S2W2R_shared_predictor>1) &
+            call AbortInvalidImplicitOption('S2W2R_shared_predictor must be 0 or 1')
+        if(S2W2R_shared_predictor==1)then
+            if((trim(adjustl(TimeIntegration_method))/='S2CN2'.and..not.IsHighOrderImplicit()).or.S2W1_wall_mode/=1.or.FluxWall_type/=1.or. &
+                ck/=1.or.Pr/=1.0_KREAL.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0.or. &
+                NP_X/=1.or.NP_Y/=1)call AbortInvalidImplicitOption('W2R supports only frozen flat type1 BGK setup')
+        endif
         select case (Quadrature_method)
         case (Quad_NewtonCotes4)
             Nu = (Nu / 4) * 4 + 1
             Nv = (Nv / 4) * 4 + 1
         case (Quad_GaussHermite)
-            if (Nu >= 28) then
+            if(len_trim(StructuredVelocityFile)>0)then
+                continue
+            elseif(VelocityMode()/='full16')then
+                if(Nu/=VelocityCount().or.Nv/=VelocityCount())call AbortInvalidImplicitOption('selected table count mismatch')
+                U_MIN=-VelocityMax();U_MAX=-U_MIN;V_MIN=U_MIN;V_MAX=U_MAX
+            elseif (Nu >= 28) then
                 Nu = 28
                 Nv = 28
                 U_MIN = -0.5392407922630E+01
@@ -817,6 +1139,11 @@ contains
             write(unit_id, '(a)') "--------------------------------------------------------------------------------"
         else
             write(unit_id, '(a)') "================================================================================="
+        endif
+        if(S2W1_wall_mode==1)then
+            write(unit_id,'(A,2ES24.16)')'S2 effective wall T_native: ',S2WallTNative
+            write(unit_id,'(A,2ES24.16)')'S2 effective wall theta: ',S2W1_wall_theta
+            write(unit_id,'(A,2ES24.16)')'S2 effective wall lambda: ',1.0_KREAL/S2WallTNative
         endif
     end subroutine WriteParameterReport
 

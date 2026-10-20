@@ -1,0 +1,46 @@
+-------------UGKS2D-DIS simulation beginning: Parallel in XY, version 2.0 (by JHOU, oujihui@tju.edu.cn)-------------
+S2 wall side 1 T_native, theta, lambda:   2.0000000000000000E+00  1.0000000000000000E+00  5.0000000000000000E-01
+S2 wall side 2 T_native, theta, lambda:   2.0000000000000000E+00  1.0000000000000000E+00  5.0000000000000000E-01
+-------------------------------Parameters check----------------------------------
+              Ma=     0.00000000            Re=     1.00000000            Kn=     0.09991823
+             AOA=     0.00000000          Tinf=     2.00000000            Tw=     2.00000000
+              ck=     1.00000000         gamma=     1.66666667            Pr=     0.66666667
+           omega=     0.50000000           Tcm=     0.40440000
+      Nstep_show=            100   Nstep_write=           1000
+             CFL= 0.10000000E+00           EPS= 0.10000000E-11     dt_global= 0.25000000E-03
+          Nx_all=              8        Ny_all=             64            Nu=             32            Nv=             32
+            NP_X=              1          NP_Y=              8
+           U_MIN=   -16.05137466         U_MAX=    16.05137466         V_MIN=   -16.05137466         V_MAX=    16.05137466
+                flag_vislaw  =  PowerLaw                      
+            TimeStep_method  =  Time_global_varying           
+     TimeIntegration_method  =                        Explicit
+              Implicit_nCFL  =   1.00000000E+03
+       Implicit_MacroSweeps  =         2     Implicit_MicroSweeps  =         1
+       Implicit_ResidualTol  =   1.00000000E-08       Implicit_MomentTol  =   1.00000000E-12        Implicit_MinAlpha  =   1.00000000E-06
+        Implicit_MaxRetries  =         0         Implicit_MaxIter  =         2
+             Unsteady_Theta  =   5.00000000E-01        Unsteady_InnerTol  =   1.00000000E-08        Unsteady_MaxInner  =        50
+      Reconstruction_method  =                 Reconst_Vanleer
+          Quadrature_method  =  Quad_GaussHermite             
+             Iflag_InitFlow  =  Init_Freestream               
+-------------------------------Boundary information------------------------------
+                BG_geometry  =  BGconst_General               
+              FluxWall_type  =  FluxWall_Multiscale           
+                 Acc coeff.  =       1.00000000
+                  Left B.C.  =  Periodic                      
+                 Right B.C.  =  Periodic                      
+                Bottom B.C.  =  Wall_isothermal               
+                 Upper B.C.  =  Wall_isothermal               
+-------------------------------Disturbance information------------------------------
+             Iflag_unsteady  =  No                            
+               Iflag_fringe  =  No                            
+                 DISBC_Type  =  None                          
+--------------------------------------------------------------------------------
+S2 effective wall T_native:   2.0000000000000000E+00  2.0000000000000000E+00
+S2 effective wall theta:   1.0000000000000000E+00  1.0000000000000000E+00
+S2 effective wall lambda:   5.0000000000000000E-01  5.0000000000000000E-01
+   iter,simTime,dsimtime,dcommtime:              2  0.5680200E-01  0.2966500E-01  0.1284000E-02
+                        dtPhysical:  0.8652772E-04
+                               res:  0.1063037E-04  0.3257391E+05  0.4734375E-03  0.2247710E+02
+           timing last total/parts:  0.2966E-01  0.1900E-04  0.0000E+00  0.1117E-02  0.2080E-01  0.6443E-02  0.1284E-02  0.0000E+00
+             timing cumulative pct:     0.08     0.00     4.59    68.03    22.87     4.42     0.00
+WARNING: Explicit reached iteration limit at 2 with max residual   3.25739053E+04

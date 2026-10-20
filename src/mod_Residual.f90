@@ -2,8 +2,11 @@ module mod_Residual
     use flow_data
     use Flow_DIS
     use mpi
+    use Tools,only:GetPrimary,GetTau,GetHeatFlux_Vec,DiscreteMaxwell_Vec,ShakhovPart_Vec
+    use mod_ImplicitCommon,only:ProjectToConservedMoments,MomentConserved
+    use mod_ImplicitMicro,only:EnforceStreamingMomentCompatibility
     use mod_S2D1, only: IsS2CN2,IsS2Steady
-    use mod_S2NativeAdapter, only: S2NativeMarkResidual,S2NativeAssembleSteadyResidual,S2NativeDiagnosticEnabled
+    use mod_S2NativeAdapter, only: S2NativeMarkResidual,S2NativeAssembleSteadyResidual,S2NativeDiagnosticEnabled,S2NativePhysicalCollision
     implicit none
 
 contains
@@ -16,6 +19,7 @@ contains
         call AssembleMacroResidual()
         call AssembleMicroFluxResidual()
         if(IsS2CN2().or.IsS2Steady()) call S2NativeMarkResidual()
+        if(UnifiedPhysicalOperators)call AssembleSteadyRateResiduals()
         if(IsS2Steady().or.S2NativeDiagnosticEnabled()) call S2NativeAssembleSteadyResidual()
     end subroutine ComputeResidual
 
@@ -75,10 +79,12 @@ contains
     !>Convert physical UGKS step increments into steady residual rates.
     !--------------------------------------------------
     subroutine AssembleSteadyRateResiduals()
-        use mod_ImplicitState, only: rate_w, stream_h, stream_b
+        use mod_ImplicitState, only: rate_w, stream_h, stream_b, &
+            physical_collision_h,physical_collision_b,physical_equilibrium_h,physical_equilibrium_b
         use, intrinsic :: ieee_arithmetic
         integer(KINT) :: i, j
-        real(KREAL) :: dt_inv
+        real(KREAL) :: dt_inv,prim(4),q(2),tau,reference_h(Nvel),reference_b(Nvel),hp(Nvel),bp(Nvel),moment(4)
+        logical::ok,local_ok,global_ok
 
         do j=1,ny
             do i=1,nx
@@ -93,6 +99,36 @@ contains
                 stream_b(:,i,j)=res_b_flux_store(:,i,j)*dt_inv
             enddo
         enddo
+        if(.not.UnifiedPhysicalOperators)return
+        if(IsS2CN2())then
+            call S2NativePhysicalCollision(physical_equilibrium_h,physical_equilibrium_b,physical_collision_h,physical_collision_b)
+            local_ok=.true.
+            do j=1,ny;do i=1,nx
+                call MomentConserved(stream_h(:,i,j),stream_b(:,i,j),uVel,vVel,wVel,moment)
+                local_ok=local_ok.and.maxval(abs(moment-rate_w(:,i,j)))/max(1.0_KREAL,maxval(abs(rate_w(:,i,j))))<=2.0e-12_KREAL
+            enddo;enddo
+        else
+            call EnforceStreamingMomentCompatibility(local_ok)
+            do j=1,ny;do i=1,nx
+                ! Publish precisely the prepared R6 physical streaming operator to explicit as well.
+                res_h_flux_store(:,i,j)=stream_h(:,i,j)*ctr(i,j)%dt_local
+                res_b_flux_store(:,i,j)=stream_b(:,i,j)*ctr(i,j)%dt_local
+                prim=GetPrimary(ctr(i,j)%conVars);tau=GetTau(prim)
+                q=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)
+                call DiscreteMaxwell_Vec(physical_equilibrium_h(:,i,j),physical_equilibrium_b(:,i,j),prim)
+                call ShakhovPart_Vec(physical_equilibrium_h(:,i,j),physical_equilibrium_b(:,i,j),q,prim,hp,bp)
+                physical_equilibrium_h(:,i,j)=physical_equilibrium_h(:,i,j)+hp
+                physical_equilibrium_b(:,i,j)=physical_equilibrium_b(:,i,j)+bp
+                reference_h=physical_equilibrium_h(:,i,j);reference_b=physical_equilibrium_b(:,i,j)
+                call ProjectToConservedMoments(physical_equilibrium_h(:,i,j),physical_equilibrium_b(:,i,j), &
+                    ctr(i,j)%conVars,uVel,vVel,wVel,reference_h,reference_b,ok)
+                local_ok=local_ok.and.ok
+                physical_collision_h(:,i,j)=(physical_equilibrium_h(:,i,j)-ctr(i,j)%h_vec)/tau
+                physical_collision_b(:,i,j)=(physical_equilibrium_b(:,i,j)-ctr(i,j)%b_vec)/tau
+            enddo;enddo
+        endif
+        call MPI_Allreduce(local_ok,global_ok,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
+        if(.not.global_ok)call MPI_Abort(MPI_COMM_WORLD,444,ierr)
     end subroutine AssembleSteadyRateResiduals
 
 end module mod_Residual

@@ -1,0 +1,410 @@
+{
+  "final_static_le": {
+    "residual_max": {
+      "rw": 3.24464069471124e-14,
+      "rh": 7.783728132147551e-15,
+      "rb": 5.4052196969628815e-15,
+      "ch": 1.7407461724385242e-16,
+      "cb": 5.439831788870388e-18
+    },
+    "update_max": {
+      "W": 2.6020852139652106e-18,
+      "h": 2.168404344971009e-19,
+      "b": 1.3877787807814457e-17
+    },
+    "mass_rescale": false,
+    "wall_interior_flux_gap_max": 5.069751085486311e-16
+  },
+  "final_static_li": {
+    "residual_max": {
+      "rw": 3.24464069471124e-14,
+      "rh": 7.783728132147551e-15,
+      "rb": 5.4052196969628815e-15,
+      "ch": 1.7407461724385242e-16,
+      "cb": 5.439831788870388e-18
+    },
+    "update_max": {
+      "W": 0.0,
+      "h": 0.0,
+      "b": 0.0
+    },
+    "mass_rescale": false,
+    "wall_interior_flux_gap_max": 5.069751085486311e-16
+  },
+  "static_le_19": {
+    "residual_max": {
+      "rw": 4.0096362875104814e-14,
+      "rh": 7.0844483729560185e-15,
+      "rb": 4.0303141227077176e-15,
+      "ch": 5.177824386374408e-21,
+      "cb": 8.284519018199053e-20
+    },
+    "update_max": {
+      "W": 3.469446951953614e-18,
+      "h": 4.336808689942018e-19,
+      "b": 5.421010862427522e-20
+    },
+    "mass_rescale": false,
+    "wall_interior_flux_gap_max": 6.237154366207351e-16
+  },
+  "static_le_np1": {
+    "residual_max": {
+      "rw": 3.24464069471124e-14,
+      "rh": 7.783728132147551e-15,
+      "rb": 5.4052196969628815e-15,
+      "ch": 1.7407461724385242e-16,
+      "cb": 5.439831788870388e-18
+    },
+    "update_max": {
+      "W": 2.6020852139652106e-18,
+      "h": 2.168404344971009e-19,
+      "b": 1.3877787807814457e-17
+    },
+    "mass_rescale": false,
+    "wall_interior_flux_gap_max": 5.069751085486311e-16
+  },
+  "debug_static_le": {
+    "residual_max": {
+      "rw": 3.007227215632861e-14,
+      "rh": 5.846644052400308e-15,
+      "rb": 5.93539372433601e-15,
+      "ch": 3.3998948680439926e-19,
+      "cb": 3.3998948680439926e-19
+    },
+    "update_max": {
+      "W": 2.6020852139652106e-18,
+      "h": 5.293955920339377e-23,
+      "b": 1.3877787807814457e-17
+    },
+    "mass_rescale": false,
+    "wall_interior_flux_gap_max": 4.440892098500626e-16
+  },
+  "static_1_vs_8_initial_operator_bitwise": true,
+  "static_explicit_implicit_initial_operator_bitwise": true,
+  "high_order_unchanged": {
+    "flow2d.dat": true,
+    "vdf2d.dat": true,
+    "closed_mass_rank0.bin": true,
+    "closed_mass_rank1.bin": true,
+    "closed_mass_rank2.bin": true,
+    "closed_mass_rank3.bin": true,
+    "closed_mass_rank4.bin": true,
+    "closed_mass_rank5.bin": true,
+    "closed_mass_rank6.bin": true,
+    "closed_mass_rank7.bin": true
+  },
+  "low_order_restart": {
+    "flow2d.dat": true,
+    "vdf2d.dat": true,
+    "closed_mass_rank0.bin": true,
+    "closed_mass_rank1.bin": true,
+    "closed_mass_rank2.bin": true,
+    "closed_mass_rank3.bin": true,
+    "closed_mass_rank4.bin": true,
+    "closed_mass_rank5.bin": true,
+    "closed_mass_rank6.bin": true,
+    "closed_mass_rank7.bin": true
+  },
+  "ma3_li3": {
+    "accepted": 3,
+    "max_moment": 3.9352846180307e-15,
+    "max_mass_error": 5.551115123125783e-16,
+    "original_scan_and_update_parameters": true
+  },
+  "protected_files_unchanged": 119,
+  "production_changed": [
+    "src/mod_Evolution.f90",
+    "Makefile"
+  ],
+  "runs": {
+    "ma3_li3": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 3
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.5448329169999999
+    },
+    "ma3_hi_baseline": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 1,
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_static_wall_20261014T134658Z/build/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_static_wall_20261014T134658Z/build/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.222128
+    },
+    "debug_static_le": {
+      "spec": {
+        "method": "low_explicit",
+        "static": true,
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/checks/debug_build/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/checks/debug_build/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.266350917
+    },
+    "static_le_localdt": {
+      "spec": {
+        "method": "low_explicit",
+        "static": true,
+        "settings": {
+          "TimeStep_method": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 200,
+      "wall_s": 0.618000125
+    },
+    "legacy_le": {
+      "spec": {
+        "method": "low_explicit",
+        "steps": 1,
+        "settings": {
+          "UnifiedPhysicalOperators": ".false."
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 200,
+      "wall_s": 0.648590667
+    },
+    "static_le_np1": {
+      "spec": {
+        "method": "low_explicit",
+        "static": true,
+        "ranks": 1
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "1",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.261046708
+    },
+    "static_le_19": {
+      "spec": {
+        "method": "low_explicit",
+        "static": true,
+        "temperature": 1.9
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.196072416
+    },
+    "legacy_le_baseline": {
+      "spec": {
+        "method": "low_explicit",
+        "steps": 1,
+        "settings": {
+          "UnifiedPhysicalOperators": ".false."
+        },
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_static_wall_20261014T134658Z/build/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_static_wall_20261014T134658Z/build/bin/ugks_solver"
+      ],
+      "exit": 200,
+      "wall_s": 0.662780291
+    },
+    "delivery_static": {
+      "spec": {
+        "method": "low_explicit",
+        "static": true,
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/checks/clean_extract/S2D_Implicit_O13_R6_VLWall_R1/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/checks/clean_extract/S2D_Implicit_O13_R6_VLWall_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.05009875
+    },
+    "final_static_li": {
+      "spec": {
+        "method": "low_implicit",
+        "static": true
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.17824991699999998
+    },
+    "final_static_le": {
+      "spec": {
+        "method": "low_explicit",
+        "static": true
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.23785583299999996
+    },
+    "ma3_le": {
+      "spec": {
+        "method": "low_explicit",
+        "steps": 1
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.0219119579999998
+    },
+    "debug_ma3_li": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 1,
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/checks/debug_build/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/checks/debug_build/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.103356875
+    },
+    "ma3_hi": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 1
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.19567425
+    },
+    "static_le": {
+      "spec": {
+        "method": "low_explicit",
+        "static": true
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.101352083
+    },
+    "ma3_li1": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 1
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.29745249999999995
+    },
+    "static_li": {
+      "spec": {
+        "method": "low_implicit",
+        "static": true
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.18331941699999998
+    },
+    "ma3_li_resume2": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 2,
+        "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/checks/runs/ma3_li1"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.466361375
+    }
+  },
+  "independent_package_build_and_static": true,
+  "numerical_process_wall_sum_s": 12.255434998999998
+}

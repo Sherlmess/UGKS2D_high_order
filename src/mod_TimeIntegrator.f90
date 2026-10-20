@@ -1,7 +1,9 @@
 module mod_TimeIntegrator
+    use mod_S2MPI1Layout,only:communication_seconds,communication_clock
     use flow_data
     use Flow_DIS
     use mpi
+    use mod_ImplicitCommon,only:ProjectToConservedMoments
     use tools
     use, intrinsic :: ieee_arithmetic
     implicit none
@@ -189,6 +191,44 @@ contains
     end subroutine AccumulateMacroResidualNorm
 
 
+    ! Output-only accepted macro update rate. No new numerical state update or RHS.
+    ! old_w remains the S2 step-start cache after publish_state updates ctr.
+    subroutine RecordAcceptedMacroUpdateRate(old_w,dt)
+        real(KREAL),intent(in)::old_w(:,:,:),dt
+        real(KREAL)::sumRes(4),sumAvg(4),sumRes_all(4),sumAvg_all(4)
+        real(KREAL)::maxCell_local(4),maxCell_all(4),areaSquared,areaSquared_all,ordinary_residual_scale
+        integer(KINT)::i,j
+        sumRes=0.0_KREAL;sumAvg=0.0_KREAL;maxCell_local=0.0_KREAL;areaSquared=0.0_KREAL
+        do j=1,ny
+            do i=1,nx
+                call AccumulateMacroResidualNorm(i,j,dt,old_w(:,i,j),sumRes,sumAvg,maxCell_local)
+                areaSquared=areaSquared+ctr(i,j)%area**2
+            enddo
+        enddo
+        communication_clock=MPI_Wtime()
+        call MPI_Barrier(MPI_COMM_WORLD,ierr)
+        call MPI_AllReduce(sumRes,sumRes_all,4,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
+        call MPI_AllReduce(sumAvg,sumAvg_all,4,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
+        call MPI_AllReduce(areaSquared,areaSquared_all,1,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
+        call MPI_AllReduce(maxCell_local,maxCell_all,4,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        res_num=sqrt(Nx_all*Ny_all*sumRes_all)
+        res_den=sumAvg_all+SMV
+        res_rms=sqrt(sumRes_all/(Nx_all*Ny_all+SMV))
+        res_max=maxCell_all
+        res_relative=res_num/res_den
+        res_absolute=sqrt(sumRes_all/max(areaSquared_all,SMV))
+        ordinary_residual_scale=max(sumAvg_all(1),sumAvg_all(4),SMV)
+        do i=1,4
+            if(IsNearZeroResidualScale(sumAvg_all(i),ordinary_residual_scale))then
+                res(i)=res_absolute(i)
+            else
+                res(i)=res_relative(i)
+            endif
+        enddo
+    end subroutine RecordAcceptedMacroUpdateRate
+
+
     !--------------------------------------------------
     !>Apply the explicit VDF update after macro variables define the new equilibrium.
     !--------------------------------------------------
@@ -204,6 +244,8 @@ contains
         real(KREAL)                                     :: h_flux_rhs,b_flux_rhs
         real(KREAL)                                     :: implicit_inv,relax_rate
         integer(KINT)                                   :: k
+        logical::ok
+        real(KREAL)::rh(Nvel),rb(Nvel)
 
         !Calculate heat flux at t=t^n directly from flattened cell-center VDF views.
         qf = GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim_old)
@@ -222,6 +264,14 @@ contains
             B_vec(k) = B_vec(k)+B_plus_vec(k)
         enddo
 
+        if(UnifiedPhysicalOperators)then
+            rh=H_old_vec;rb=B_old_vec
+            call ProjectToConservedMoments(H_old_vec,B_old_vec,GetConserved(prim_old),uVel,vVel,wVel,rh,rb,ok)
+            if(.not.ok)call MPI_Abort(MPI_COMM_WORLD,444,ierr)
+            rh=H_vec;rb=B_vec
+            call ProjectToConservedMoments(H_vec,B_vec,ctr(i,j)%conVars,uVel,vVel,wVel,rh,rb,ok)
+            if(.not.ok)call MPI_Abort(MPI_COMM_WORLD,444,ierr)
+        endif
         !Update micro distribution values through 1D views.
         implicit_inv = 1.0_KREAL/(1.0_KREAL+0.5_KREAL*dt/tau)
         relax_rate = dt*Xlamd(i,j)

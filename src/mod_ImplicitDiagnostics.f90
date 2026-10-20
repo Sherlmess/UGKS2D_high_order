@@ -10,7 +10,7 @@ module mod_ImplicitDiagnostics
     use, intrinsic :: iso_fortran_env, only: output_unit
     implicit none
     private
-    public :: InitializeImplicitDiagnostics, UpdateImplicitResidualDiagnostics
+    public :: InitializeImplicitDiagnostics, UpdateImplicitResidualDiagnostics, GetImplicitReferences, InheritImplicitReferences
     public :: ImplicitConverged, WriteImplicitResidual, AbortSteadyImplicit
     public :: CollectImplicitTimingMaxima
     public :: AcceptedStateAdmissibilityDiagnostics, CollectAcceptedStateAdmissibilityDiagnostics
@@ -243,6 +243,18 @@ contains
             prim=GetPrimary(ctr(i,j)%conVars)
             tau_value=GetTau(prim)
             q_current=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim)
+            if(UnifiedPhysicalOperators)then
+                block
+                    use mod_ImplicitState,only:peh=>physical_equilibrium_h,peb=>physical_equilibrium_b, &
+                        pch=>physical_collision_h,pcb=>physical_collision_b
+                    physical_equilibrium_h=peh(:,i,j);physical_equilibrium_b=peb(:,i,j)
+                    do k=1,Nvel
+                        dh=stream_h(k,i,j)+pch(k,i,j);db=stream_b(k,i,j)+pcb(k,i,j)
+                        micro_sums_local(1)=micro_sums_local(1)+ctr(i,j)%area*wVel(k)*dh*dh
+                        micro_sums_local(2)=micro_sums_local(2)+ctr(i,j)%area*wVel(k)*db*db
+                    enddo
+                end block
+            else
             call DiscreteMaxwell_Vec(physical_equilibrium_h,physical_equilibrium_b,prim)
             call ShakhovPart_Vec(physical_equilibrium_h,physical_equilibrium_b,q_current,prim,h_plus,b_plus)
             physical_equilibrium_h=physical_equilibrium_h+h_plus
@@ -260,6 +272,7 @@ contains
                 micro_sums_local(1)=micro_sums_local(1)+ctr(i,j)%area*wVel(k)*dh*dh
                 micro_sums_local(2)=micro_sums_local(2)+ctr(i,j)%area*wVel(k)*db*db
             enddo
+            endif
             micro_sums_local(3)=micro_sums_local(3)+ctr(i,j)%area*sum(wVel* &
                 max(ctr(i,j)%h_vec**2,physical_equilibrium_h**2))
             micro_sums_local(4)=micro_sums_local(4)+ctr(i,j)%area*sum(wVel* &
@@ -275,6 +288,7 @@ contains
         call MPI_Allreduce(mass_local,mass_global,1,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
         implicit_macro_relative=sqrt(real(Nx_all*Ny_all,KREAL)*macro_num_global)/(macro_den_global+SMV)
         implicit_macro_absolute=sqrt(macro_num_global/max(macro_weight_global,SMV))
+        r5_raw_h=sqrt(micro_sums_global(1));r5_raw_b=sqrt(micro_sums_global(2))
         ordinary_macro_scale=max(macro_den_global(1),macro_den_global(4),SMV)
         do k=1,4
             if (IsNearZeroResidualScale(macro_den_global(k),ordinary_macro_scale)) then
@@ -307,6 +321,20 @@ contains
         implicit_b_norm=RelativeOrAbsoluteResidual(b_raw,reference_b,near_zero_micro_reference)
     end subroutine UpdateImplicitResidualDiagnostics
 
+    ! R6 restart wiring only: inherit the native R5 micro reference epoch.
+    ! Residual formulas, current-state macro denominators and numerical updates are unchanged.
+    subroutine InheritImplicitReferences(h,b)
+        real(KREAL),intent(in) :: h,b
+        if (.not.ieee_is_finite(h) .or. .not.ieee_is_finite(b) .or. h<=0.0_KREAL .or. b<=0.0_KREAL) &
+            call AbortSteadyImplicit('invalid inherited residual references')
+        reference_h=h;reference_b=b;references_initialized=.true.
+    end subroutine
+
+    subroutine GetImplicitReferences(h,b)
+        real(KREAL),intent(out) :: h,b
+        h=reference_h;b=reference_b
+    end subroutine
+
     logical function ImplicitConverged()
         ImplicitConverged=all(implicit_macro_residual<=Implicit_ResidualTol) .and. &
             implicit_h_norm<=Implicit_ResidualTol .and. &
@@ -325,11 +353,15 @@ contains
         call MPI_Allreduce(timing_local,timing_global,8,MPI_KREAL,MPI_MAX,MPI_COMM_WORLD,ierr)
     end subroutine CollectImplicitTimingMaxima
 
-    subroutine WriteImplicitResidual(wall_time)
+    subroutine WriteImplicitResidual(wall_time,c_minus_1)
         real(KREAL), intent(in) :: wall_time
+        real(KREAL), optional, intent(in) :: c_minus_1
+        real(KREAL) :: output_c_minus_1
         real(KREAL) :: dt_local_min,dt_global_min,timing_global(8)
         integer(KINT) :: i,j
 
+        output_c_minus_1=0.0_KREAL
+        if(present(c_minus_1))output_c_minus_1=c_minus_1
         dt_local_min=huge(1.0_KREAL)
         do j=1,ny; do i=1,nx
             dt_local_min=min(dt_local_min,ctr(i,j)%dt_local)
@@ -344,16 +376,17 @@ contains
                     'prSeconds lusgsSeconds correctionExchangeSeconds evolutionSeconds retryTotal ' // &
                     'rhoRelative rhoURelative rhoVRelative energyRelative rhoAbsolute rhoUAbsolute ' // &
                     'rhoVAbsolute energyAbsolute hRelative bRelative hAbsolute bAbsolute ' // &
-                    'microForwardSeconds microBackwardSeconds microForwardBackwardExchangeSeconds'
+                    'microForwardSeconds microBackwardSeconds microForwardBackwardExchangeSeconds c_minus_1 mass_rescale_enabled'
                 residual_output_initialized=.true.
             else
                 open(104,file='ResidualImplicit.plt',status='unknown',action='write',position='append')
             endif
-            write(104,'(I12,1P,11E18.9,I8,5E18.9,I12,15E18.9)') iter,dt_global_min,implicit_ncfl_active,implicit_alpha, &
+            write(104,'(I12,1P,11E18.9,I8,5E18.9,I12,15E18.9,2ES25.16E3)') iter,dt_global_min,implicit_ncfl_active,implicit_alpha, &
                 implicit_macro_residual,implicit_h_norm,implicit_b_norm,implicit_moment_error,implicit_mass_defect, &
                 implicit_retry_count,timing_global(1:5),implicit_retry_total,implicit_macro_relative, &
                 implicit_macro_absolute,implicit_h_relative,implicit_b_relative, &
-                implicit_h_absolute,implicit_b_absolute,timing_global(6:8)
+                implicit_h_absolute,implicit_b_absolute,timing_global(6:8), &
+                output_c_minus_1,merge(1.0_KREAL,0.0_KREAL,ClosedCouetteMassRescale)
             close(104)
             write(output_unit,'(A,I0,1P,11(A,E12.4),2(A,I0))') &
                 'Implicit iter=',iter,' nCFL=',implicit_ncfl_active,' alpha=',implicit_alpha, &

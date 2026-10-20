@@ -1,5 +1,6 @@
 module mpi_wrapper
     use mpi
+    use mod_S2MPI1Layout, only: communication_seconds,communication_clock
     use mpi_para
     use flow_data
     implicit none
@@ -13,13 +14,15 @@ contains
 
         !total processer
         NP_XY = NP_X*NP_Y
+        communication_clock=MPI_Wtime()
         call MPI_Comm_Size(MPI_COMM_WORLD,np_size,ierr)      ! get total np size
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         if(np_size .ne. NP_XY) then
             if(myID .eq. 0) then
                 print*, 'Number of Total Procs is ',np_size
                 print*, 'Number of Total procs is not equal to NP_X*NP_Y!!!'
             endif
-            stop
+            call MPI_Abort(MPI_COMM_WORLD,471,ierr)
         endif
         
         !current processer
@@ -50,6 +53,15 @@ contains
         Nx = Block_XY(IP_XY)%NI
         Ny = Block_XY(IP_XY)%NJ
         
+        ! High-order halos can cross multiple neighbours. Only empty blocks
+        ! are forbidden; arbitrary positive NP_X/NP_Y need not divide the grid.
+        if(trim(TimeIntegration_method)=='S2CN2')then
+            if(NP_X<1.or.NP_Y<1.or.NP_X>Nx_all.or.NP_Y>Ny_all)then
+                if(myID==0)write(*,*)'S2 requires positive decomposition with at least one cell per rank'
+                call MPI_Abort(MPI_COMM_WORLD,470,ierr)
+            endif
+        endif
+
         !communication node with current block
         ipx1        = mymod(IP_X-1,NP_X)                !ID_X_Minus:  -1 proc in x-direction
         ipx2        = mymod(IP_X+1,NP_X)                !ID_X_Plus:   +1 proc in x-direction
@@ -120,10 +132,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*ny*Ndata_send, MPI_KREAL, ID_X_minus, 7000, &
                           tmp_recv2, LAP*ny*Ndata_send, MPI_KREAL, ID_X_plus,  7000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*ny*Ndata_send, MPI_KREAL, ID_X_plus,  6000,   &
                           tmp_recv1, LAP*ny*Ndata_send, MPI_KREAL, ID_X_minus, 6000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
         if(ID_X_minus .ne. MPI_PROC_NULL) then
             do j=1,ny
@@ -151,7 +167,9 @@ contains
             enddo
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         
         
         !------------------------------------------
@@ -175,10 +193,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_minus, 9000, &
                           tmp_recv2, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_plus,  8000,   &
                           tmp_recv1, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
 
         if(ID_Y_minus .ne. MPI_PROC_NULL) then
@@ -208,7 +230,9 @@ contains
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
         
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
     
     end subroutine MPIUpdate_CellCoordinates
     
@@ -234,10 +258,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*ny*Ndata_send, MPI_KREAL, ID_X_minus, 7000, &
                           tmp_recv2, LAP*ny*Ndata_send, MPI_KREAL, ID_X_plus,  7000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*ny*Ndata_send, MPI_KREAL, ID_X_plus,  6000,   &
                           tmp_recv1, LAP*ny*Ndata_send, MPI_KREAL, ID_X_minus, 6000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
         if(ID_X_minus .ne. MPI_PROC_NULL) then
             do j=1,ny
@@ -257,7 +285,9 @@ contains
             enddo
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         
         
         !------------------------------------------
@@ -272,10 +302,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_minus, 9000, &
                           tmp_recv2, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_plus,  8000,   &
                           tmp_recv1, LAP*nx*Ndata_send, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
 
         if(ID_Y_minus .ne. MPI_PROC_NULL) then
@@ -297,7 +331,9 @@ contains
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
         
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
     
     end subroutine MPIUpdate_CellConVars
     
@@ -325,10 +361,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*ny*Nvel*Ndata_send, MPI_KREAL, ID_X_minus, 7000, &
                           tmp_recv2, LAP*ny*Nvel*Ndata_send, MPI_KREAL, ID_X_plus,  7000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*ny*Nvel*Ndata_send, MPI_KREAL, ID_X_plus,  6000,   &
                           tmp_recv1, LAP*ny*Nvel*Ndata_send, MPI_KREAL, ID_X_minus, 6000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
         if(ID_X_minus .ne. MPI_PROC_NULL) then
             do j=1,ny
@@ -350,7 +390,9 @@ contains
             enddo
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         
         
         !------------------------------------------
@@ -368,10 +410,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*nx*Nvel*Ndata_send, MPI_KREAL, ID_Y_minus, 9000, &
                           tmp_recv2, LAP*nx*Nvel*Ndata_send, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*nx*Nvel*Ndata_send, MPI_KREAL, ID_Y_plus,  8000,   &
                           tmp_recv1, LAP*nx*Nvel*Ndata_send, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
 
         if(ID_Y_minus .ne. MPI_PROC_NULL) then
@@ -395,7 +441,9 @@ contains
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
         
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
     
     end subroutine MPIUpdate_CellVDF
     
@@ -442,10 +490,14 @@ contains
             tmp_send2(i,LAP+1:LAP+LAP,5)=ctr(nx-LAP+i,ny+1:ny+LAP)%area
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_minus, 7000, &
                           tmp_recv2, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_plus,  7000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_plus,  6000,   &
                           tmp_recv1, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_minus, 6000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
         if(ID_X_minus .ne. MPI_PROC_NULL) then
             do i=1,LAP
@@ -477,7 +529,9 @@ contains
             enddo
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         
         
         !------------------------------------------
@@ -509,10 +563,14 @@ contains
             tmp_send2(LAP+1:LAP+LAP,j,5)=ctr(nx+1:nx+LAP,ny+j-LAP)%area
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_minus, 9000, &
                           tmp_recv2, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_plus,  8000,   &
                           tmp_recv1, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
 
         if(ID_Y_minus .ne. MPI_PROC_NULL) then
@@ -546,7 +604,9 @@ contains
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
         
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
     
     end subroutine MPIUpdate_Conner_Coordinates
     
@@ -578,10 +638,14 @@ contains
         enddo
         
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_minus, 7000, &
                           tmp_recv2, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_plus,  7000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_plus,  6000,   &
                           tmp_recv1, LAP*LAP*2*Ndata_send, MPI_KREAL, ID_X_minus, 6000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
         if(ID_X_minus .ne. MPI_PROC_NULL) then
             do i=1,LAP
@@ -605,7 +669,9 @@ contains
             enddo
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         
         
         !------------------------------------------
@@ -625,10 +691,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_minus, 9000, &
                           tmp_recv2, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_plus,  8000,   &
                           tmp_recv1, LAP*2*LAP*Ndata_send, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
 
         if(ID_Y_minus .ne. MPI_PROC_NULL) then
@@ -654,7 +724,9 @@ contains
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
         
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
     
     end subroutine MPIUpdate_Conner_conVars
     
@@ -687,10 +759,14 @@ contains
             enddo   
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*LAP*2*Nvel*Ndata_send, MPI_KREAL, ID_X_minus, 7000, &
                           tmp_recv2, LAP*LAP*2*Nvel*Ndata_send, MPI_KREAL, ID_X_plus,  7000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*LAP*2*Nvel*Ndata_send, MPI_KREAL, ID_X_plus,  6000,   &
                           tmp_recv1, LAP*LAP*2*Nvel*Ndata_send, MPI_KREAL, ID_X_minus, 6000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
         if(ID_X_minus .ne. MPI_PROC_NULL) then
             do i=1,LAP
@@ -718,7 +794,9 @@ contains
             enddo
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         
         
         !------------------------------------------
@@ -741,10 +819,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*2*LAP*Nvel*Ndata_send, MPI_KREAL, ID_Y_minus, 9000, &
                           tmp_recv2, LAP*2*LAP*Nvel*Ndata_send, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*2*LAP*Nvel*Ndata_send, MPI_KREAL, ID_Y_plus,  8000,   &
                           tmp_recv1, LAP*2*LAP*Nvel*Ndata_send, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
 
         if(ID_Y_minus .ne. MPI_PROC_NULL) then
@@ -774,7 +856,9 @@ contains
         endif
         deallocate(tmp_send1,tmp_send2,tmp_recv1,tmp_recv2)
         
+        communication_clock=MPI_Wtime()
         call MPI_BARRIER(MPI_COMM_WORLD,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
     
      end subroutine MPIUpdate_Conner_VDF
      
@@ -797,10 +881,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*ny, MPI_KREAL, ID_X_minus, 9000, &
                           tmp_recv2, LAP*ny, MPI_KREAL, ID_X_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*ny, MPI_KREAL, ID_X_plus,  8000,   &
                           tmp_recv1, LAP*ny, MPI_KREAL, ID_X_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
         if(ID_X_minus .ne. MPI_PROC_NULL) then
             do j=1,ny
@@ -838,10 +926,14 @@ contains
             enddo
         enddo
 
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send1, LAP*nx, MPI_KREAL, ID_Y_minus, 9000, &
                           tmp_recv2, LAP*nx, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(tmp_send2, LAP*nx, MPI_KREAL, ID_Y_plus,  8000,   &
                           tmp_recv1, LAP*nx, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
 
 
         if(ID_Y_minus .ne. MPI_PROC_NULL) then
@@ -879,12 +971,16 @@ contains
                 p=p+1; sxm(p)=field(m,1,j); sxp(p)=field(m,nx,j)
             enddo
         enddo
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(sxm,size(sxm),MPI_KREAL,ID_X_minus,tag_base, &
                           rxp,size(rxp),MPI_KREAL,ID_X_plus,tag_base, &
                           MPI_COMM_WORLD,Status,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(sxp,size(sxp),MPI_KREAL,ID_X_plus,tag_base+1, &
                           rxm,size(rxm),MPI_KREAL,ID_X_minus,tag_base+1, &
                           MPI_COMM_WORLD,Status,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         if (ID_X_minus/=MPI_PROC_NULL) then
             p=0
             do j=1,ny
@@ -910,12 +1006,16 @@ contains
                 p=p+1; sym(p)=field(m,i,1); syp(p)=field(m,i,ny)
             enddo
         enddo
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(sym,size(sym),MPI_KREAL,ID_Y_minus,tag_base+2, &
                           ryp,size(ryp),MPI_KREAL,ID_Y_plus,tag_base+2, &
                           MPI_COMM_WORLD,Status,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
+        communication_clock=MPI_Wtime()
         call MPI_Sendrecv(syp,size(syp),MPI_KREAL,ID_Y_plus,tag_base+3, &
                           rym,size(rym),MPI_KREAL,ID_Y_minus,tag_base+3, &
                           MPI_COMM_WORLD,Status,ierr)
+        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
         if (ID_Y_minus/=MPI_PROC_NULL) then
             p=0
             do i=1,nx

@@ -1,1 +1,0 @@
-step,time,face_moment,target_moment,cn_residual,macro_micro,limited,signed,dt_tau,cfl,h_min,h_max,b_min,b_max,global_drift,layout_s,face_s,map_s,collision_s,diagnostic_s

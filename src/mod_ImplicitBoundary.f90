@@ -7,7 +7,7 @@ module mod_ImplicitBoundary
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     implicit none
     private
-    public :: BuildStructuredMirrorMaps, GetMacroBoundaryDelta
+    public :: BuildStructuredMirrorMaps, GetMacroBoundaryDelta, ZhuMovingWallMap
     public :: GetSymmetryMicroDelta, GetSymmetryMicroValue, ComputeDiffuseWallFaceDelta
     public :: ComputeMaxwellWallFaceDelta
     public :: ResolveImplicitBoundaryType, IsAxisAlignedSymmetryNormal
@@ -182,12 +182,24 @@ contains
         call MPI_Abort(MPI_COMM_WORLD, 202, ierr)
     end subroutine AbortMirrorMap
 
-    subroutine GetMacroBoundaryDelta(boundary_type,nx_face,ny_face,delta_inner,delta_boundary,ok)
+    ! W=[rho,rho*U,rho*V,rho*E]. The linear map is both Eq.(28)'s ghost state
+    ! (equal pressure/internal energy) and its exact tangent, Eq.(29), Zhu et al. 2016.
+    pure function ZhuMovingWallMap(w,uw,vw) result(ghost)
+        real(KREAL), intent(in) :: w(4),uw,vw
+        real(KREAL) :: ghost(4)
+        ghost(1)=w(1)
+        ghost(2)=2.0_KREAL*uw*w(1)-w(2)
+        ghost(3)=2.0_KREAL*vw*w(1)-w(3)
+        ghost(4)=w(4)+2.0_KREAL*(uw*uw+vw*vw)*w(1)-2.0_KREAL*uw*w(2)-2.0_KREAL*vw*w(3)
+    end function ZhuMovingWallMap
+
+    subroutine GetMacroBoundaryDelta(boundary_type,nx_face,ny_face,delta_inner,delta_boundary,ok,face_number)
         integer(KINT), intent(in) :: boundary_type
         real(KREAL), intent(in) :: nx_face, ny_face, delta_inner(4)
         real(KREAL), intent(out) :: delta_boundary(4)
         logical, intent(out) :: ok
-        real(KREAL) :: normal_momentum
+        integer(KINT), intent(in), optional :: face_number
+        real(KREAL) :: normal_momentum,wall_prim(4)
 
         ok=.true.
         select case(boundary_type)
@@ -195,7 +207,21 @@ contains
             delta_boundary=0.0_KREAL
         case(BCconst_extrapolation)
             delta_boundary=delta_inner
-        case(BCconst_symmetry,BCconst_wall_isothermal)
+        case(BCconst_wall_isothermal)
+            if (Implicit_ZhuMovingWall) then
+                ok=.false.; delta_boundary=0.0_KREAL
+                if (.not.present(face_number)) return
+                if (face_number<1 .or. face_number>4) return
+                wall_prim=WallPrimary(face_number)
+                delta_boundary=ZhuMovingWallMap(delta_inner,wall_prim(2),wall_prim(3))
+                ok=.true.
+            else
+                delta_boundary=delta_inner
+                normal_momentum=delta_inner(2)*nx_face+delta_inner(3)*ny_face
+                delta_boundary(2)=delta_inner(2)-2.0_KREAL*normal_momentum*nx_face
+                delta_boundary(3)=delta_inner(3)-2.0_KREAL*normal_momentum*ny_face
+            endif
+        case(BCconst_symmetry)
             delta_boundary=delta_inner
             normal_momentum=delta_inner(2)*nx_face+delta_inner(3)*ny_face
             delta_boundary(2)=delta_inner(2)-2.0_KREAL*normal_momentum*nx_face

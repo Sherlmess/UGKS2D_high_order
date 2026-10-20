@@ -7,7 +7,6 @@ module mod_CorrectedWF2DEquilibrium
     implicit none
     private
 
-    public :: ConstantBGKModel2D
     public :: primitive_from_conserved_2d, analytic_maxwellian_2d
     public :: analytic_maxwellian_direction_2d
     public :: constant_bgk_cell_average_target_2d
@@ -22,6 +21,7 @@ module mod_CorrectedWF2DEquilibrium
 
 contains
 
+    ! Public keyword temp retained: it means T_native=1/lambda, not theta.
     subroutine primitive_from_conserved_2d(w,ck,rho,u,v,temp,ok)
         real(KREAL), intent(in) :: w(4)
         integer(KINT), intent(in) :: ck

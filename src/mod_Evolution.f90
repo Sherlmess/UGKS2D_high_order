@@ -1,6 +1,7 @@
 module mod_Evolution
     use flow_data
     use tools
+    use mod_ImplicitCommon, only: ProjectToConservedMoments, MomentConserved
     use mod_Interpolation,only: InterpInner
     use mod_S2D1, only: IsS2CN2,IsS2Steady
     use mod_S2NativeAdapter, only: S2NativeEvolution
@@ -9,6 +10,25 @@ module mod_Evolution
     integer(KREAL), parameter                           :: MTUM = 5 !Number of tangential velocity moments
     
 contains
+
+    ! Reuse the low-order body equilibrium preparation, not the S2 Q solver.
+    ! This prepares a local target; it never changes an accepted state or correction.
+    subroutine PrepareNativeFaceEquilibrium(h,b,vn,vt,prim)
+        real(KREAL),intent(out)::h(:),b(:)
+        real(KREAL),intent(in)::vn(:),vt(:),prim(4)
+        real(KREAL)::reference_h(size(h)),reference_b(size(b)),target(4)
+        logical::ok
+        integer::abort_error
+        call DiscreteMaxwell_LocalVec(h,b,vn,vt,prim)
+        if(.not.UnifiedPhysicalOperators)return
+        reference_h=h;reference_b=b;target=GetConserved(prim)
+        call ProjectToConservedMoments(h,b,target,vn,vt,wVel,reference_h,reference_b,ok)
+        if(.not.ok)then
+            call MPI_Abort(MPI_COMM_WORLD,446,abort_error)
+            error stop 'native face equilibrium preparation failed'
+        endif
+    end subroutine PrepareNativeFaceEquilibrium
+
 
     ! Keep the frozen native Evolution body in a branch-free procedure so
     ! selecting S2CN2 cannot perturb code generation for the default path.
@@ -68,25 +88,25 @@ contains
         !---------------------------------------------------------------------------
         if(IP_X==0 .and. bc_type(1)==BCconst_wall_isothermal) then    !I direction and lower boundaryface
             do j=1,ny
-                call CalcFluxBoundary(Prim_wall,vface(1,j),ctr(1,j),IDIRC,Lside) !RN means no frame rotation
+                call CalcFluxBoundary(WallPrimary(1),vface(1,j),ctr(1,j),IDIRC,Lside) !RN means no frame rotation
             enddo
         endif
             
         if(IP_X==NP_X-1 .and. bc_type(2)==BCconst_wall_isothermal) then   !I direction and upper boundaryface
             do j=1,ny
-                call CalcFluxBoundary(Prim_wall,vface(nx+1,j),ctr(nx,j),IDIRC,Rside) !RY means frame rotation
+                call CalcFluxBoundary(WallPrimary(2),vface(nx+1,j),ctr(nx,j),IDIRC,Rside) !RY means frame rotation
             enddo
         endif
             
         if(IP_Y==0 .and. bc_type(3)==BCconst_wall_isothermal) then   !J direction and lower boundaryface
             do i=1,nx
-                call CalcFluxBoundary(Prim_wall,hface(i,1),ctr(i,1),JDIRC,Lside) !RN means no frame rotation
+                call CalcFluxBoundary(WallPrimary(3),hface(i,1),ctr(i,1),JDIRC,Lside) !RN means no frame rotation
             enddo   
         endif
                 
         if(IP_Y==NP_Y-1 .and. bc_type(4)==BCconst_wall_isothermal) then   !J direction and upper boundaryface
             do i=1,nx
-                call CalcFluxBoundary(Prim_wall,hface(i,ny+1),ctr(i,ny),JDIRC,Rside) !RY means frame rotation
+                call CalcFluxBoundary(WallPrimary(4),hface(i,ny+1),ctr(i,ny),JDIRC,Rside) !RY means frame rotation
             enddo    
         endif
         
@@ -344,7 +364,7 @@ contains
         !Calculate the flux of conservative variables related to g+ and f0
         !--------------------------------------------------
         !Maxwellian distribution H0 and B0
-        call DiscreteMaxwell_LocalVec(H0_vec,B0_vec,vn_vec,vt_vec,prim)
+        call PrepareNativeFaceEquilibrium(H0_vec,B0_vec,vn_vec,vt_vec,prim)
     
         !Calculate heat flux
         qf = GetHeatFlux_LocalVec(h_vec,b_vec,vn_vec,vt_vec,prim)
@@ -446,6 +466,12 @@ contains
         !R_flux == L_flux
         face%R_flux     = face%L_flux
     
+        ! Match the native body discrete moment convention. No flux/state projection.
+        if(UnifiedPhysicalOperators)then
+            call MomentConserved(face%L_flux_h_vec,face%L_flux_b_vec,uVel,vVel,wVel,face%L_flux)
+            call MomentConserved(face%R_flux_h_vec,face%R_flux_b_vec,uVel,vVel,wVel,face%R_flux)
+        endif
+
         !--------------------------------------------------
         !Aftermath
         !--------------------------------------------------
@@ -840,7 +866,11 @@ contains
         if (FluxWall_type==FluxWall_Kinetic) then
             call KineticFluxBoundary(bc,face,cell,idx,side)
         elseif (FluxWall_type==FluxWall_Multiscale) then
-            call MultiscaleFluxBoundary(bc,face,cell,idx,side)
+            if(CouetteUseW2BWall)then
+                call W2BMultiscaleFluxBoundary(bc,face,cell,idx,side)
+            else
+                call MultiscaleFluxBoundary(bc,face,cell,idx,side)
+            endif
         elseif (FluxWall_type==FluxWall_Maxwell) then
             call KBC_Maxwell(bc,face,cell,idx,side)
         else
@@ -1855,4 +1885,567 @@ contains
     end function Moment_auvxi
     
     
+    subroutine W2BMultiscaleFluxBoundary(bc,face,cell,idx,side)
+        real(KREAL), intent(in)                         :: bc(4) !Primary variables at boundary
+        type(CellInterface), intent(inout)              :: face
+        type(CellCenter), intent(in)                    :: cell
+        integer(KINT), intent(in)                       :: idx,side
+        integer(KINT)                                   :: k !Flattened velocity-space index
+        real(KREAL)                                     :: rot
+        real(KREAL), allocatable, dimension(:)          :: vn_vec,vt_vec !Pure 1D local-frame velocities
+        real(KREAL), allocatable, dimension(:)          :: h_vec,b_vec !Pure 1D reconstructed wall distributions
+        real(KREAL), allocatable, dimension(:)          :: H_g_vec,B_g_vec !Pure 1D interface Maxwellian arrays
+        real(KREAL), allocatable, dimension(:)          :: H_w_vec,B_w_vec !Pure 1D wall Maxwellian arrays
+        real(KREAL), allocatable, dimension(:)          :: H_plus_vec,B_plus_vec !Pure 1D Shakhov correction arrays
+        real(KREAL)                                     :: qf(2)
+        real(KREAL), allocatable, dimension(:)          :: delta_vec !Pure 1D wall upwind selector
+        real(KREAL)                                     :: flux(4)
+        real(KREAL)                                     :: flux_wall(4) !Accumulated wall macro-flux correction from Nvel loop
+        real(KREAL)                                     :: prim(4)
+        real(KREAL)                                     :: prim_g(4) !Primary variables of g_{i+1/2}
+        real(KREAL)                                     :: prim_shape(4)
+        real(KREAL)                                     :: prim_w(4) !boundary condition in local frame
+        real(KREAL)                                     :: prim_g0(4),conVars_g0(4),conVars_g(4),conVars_g1(4)
+        real(KREAL)                                     :: incidence,reflection
+        !real(KREAL)                                     :: tau,T1,T4,T5
+        real(KREAL)                                     :: tau,Mt(5)
+        real(KREAL)                                     :: wk,vnK,vtK,v2 !Reusable velocity-space scalars for Nvel loops
+        real(KREAL)                                     :: deltaK,inflowK !Wall reflected/incident selectors for Nvel loops
+        real(KREAL)                                     :: H_gK,B_gK,H_wK,B_wK !Per-velocity Maxwellian values for micro flux
+        real(KREAL)                                     :: H_plusK,B_plusK !Per-velocity Shakhov correction values for micro flux
+        real(KREAL)                                     :: hK,bK !Per-velocity reconstructed distribution values
+        real(KREAL)                                     :: shnK,sbnK,shtK,sbtK !Per-velocity distribution slopes
+        real(KREAL)                                     :: slope_hK,slope_bK !Per-velocity normal/tangential slope combinations
+        real(KREAL)                                     :: wallExpK !Per-velocity Maxwellian kernel used by wall reflection
+        real(KREAL)                                     :: Ha_gnK,Ha_gtK,Ha_TK !Per-velocity h-space expansion terms
+        real(KREAL)                                     :: Ba_gnK,Ba_gtK,Ba_TK !Per-velocity b-space expansion terms
+        real(KREAL)                                     :: dt   !local time step
+
+        real(KREAL),parameter :: PI=4.0_KREAL*atan(1.0_KREAL) ! Only this new wall kernel.
+
+        ! additional variables for slope calculation
+        real(KREAL), allocatable, dimension(:)          :: shn_vec,sbn_vec !Pure 1D normal distribution slopes
+        !real(KREAL), allocatable, dimension(:,:)        :: Ha_gn, Ba_gn
+        !real(KREAL), allocatable, dimension(:,:)        :: Ha_gt, Ba_gt 
+        !real(KREAL), allocatable, dimension(:,:)        :: Ha_T, Ba_T  
+        real(KREAL)                                     :: a_gn(4), a_gt(4), a_T(4)    
+        real(KREAL)                                     :: sw(4), sw_T(4)
+        real(KREAL)                                     :: Mau(4), Mbv(4), Mau0(4), MauT(4)
+        real(KREAL)                                     :: Mu(0:MNUM),MuL(0:MNUM),MuR(0:MNUM)
+        real(KREAL)                                     :: Mv(0:MTUM),Mxi(0:2)
+
+        ! tangential slope variables
+        real(KREAL), allocatable, dimension(:)          :: sht_vec,sbt_vec !Pure 1D tangential distribution slopes
+        !limiter of tangential slope
+        !real(KREAL)                                     :: tan_len, d_rho_t, limiter_phi
+        !real(KREAL), parameter                          :: EPS = 1.0e-10
+        !real(KREAL), parameter                          :: LIMIT_THRESHOLD = 0.5  ! allow max 50% change in tangential direction
+
+
+
+        !--------------------------------------------------
+        !prepare
+        !--------------------------------------------------
+        !Allocate pure 1D velocity-space temporaries for multiscale wall flux loops.
+        allocate(vn_vec(Nvel))
+        allocate(vt_vec(Nvel))
+        allocate(delta_vec(Nvel))
+        allocate(h_vec(Nvel))
+        allocate(b_vec(Nvel))
+        allocate(H_plus_vec(Nvel))
+        allocate(B_plus_vec(Nvel))
+        allocate(H_g_vec(Nvel))
+        allocate(B_g_vec(Nvel))
+        allocate(H_w_vec(Nvel))
+        allocate(B_w_vec(Nvel))
+        allocate(shn_vec(Nvel))
+        allocate(sbn_vec(Nvel))
+        allocate(sht_vec(Nvel))
+        allocate(sbt_vec(Nvel))
+
+        !Time step
+        dt = cell%dt_local
+        
+        !Frame rotation
+        rot = -side
+
+        !Convert velocity space to the wall frame and build the wall upwind selector.
+        do k=1,Nvel
+            vn_vec(k) = uVel(k)*face%cosx+vVel(k)*face%cosy
+            vt_vec(k) =-uVel(k)*face%cosy+vVel(k)*face%cosx
+            delta_vec(k) = (sign(UP,vn_vec(k))*rot+1.0_KREAL)/2.0_KREAL
+        enddo
+
+        !--------------------------------------------------
+        !Reconstruct non-equlibrium distribution at interface
+        !--------------------------------------------------
+        !Load normal and tangential slopes through 1D velocity views.
+        do k=1,Nvel
+            shn_vec(k) = cell%sh_vec(k,idx)
+            sbn_vec(k) = cell%sb_vec(k,idx)
+
+            if (idx == 1) then ! normal is x, tangential is y
+                sht_vec(k) = cell%sh_vec(k,2)
+                sbt_vec(k) = cell%sb_vec(k,2)
+                !tan_len = cell%length(2) ! tangential length
+            else ! normal is y, tangential is x
+                sht_vec(k) = -cell%sh_vec(k,1)
+                sbt_vec(k) = -cell%sb_vec(k,1)
+                !tan_len = cell%length(1) ! tangential length
+            end if
+        enddo
+
+        !Limiter
+        ! calculaate the density change due to tangential slope
+        !d_rho_t = sum(weight*sht) * (0.5 * tan_len)
+        
+        ! If the density change > 50% of the center density, calculate a reduction factor phi
+        ! prim(1) is the density of the current cell
+        !prim = GetPrimary(cell%conVars) ! temporarily get for comparison
+        !
+        !if (abs(d_rho_t) > LIMIT_THRESHOLD * prim(1)) then
+        !    limiter_phi = (LIMIT_THRESHOLD * prim(1)) / (abs(d_rho_t) + EPS)
+        !else
+        !    limiter_phi = 1.0
+        !end if
+        
+        !sht = sht * limiter_phi
+        !sbt = sbt * limiter_phi
+        
+        ! if use tangential slope sht,sbt, all Mt(5) need change vn*sh to (vn*sh + vt*sht),vn*sb to (vn*sb + vt*sbt)
+
+        !Reconstruct incident non-equilibrium distribution at the wall.
+        do k=1,Nvel
+            h_vec(k) = cell%h_vec(k)-rot*0.5_KREAL*cell%length(idx)*shn_vec(k)
+            b_vec(k) = cell%b_vec(k)-rot*0.5_KREAL*cell%length(idx)*sbn_vec(k)
+        enddo
+
+        !Calculate primary variable of g_{i+1/2} in local frame
+        prim_w = LocalFrame(bc,face%cosx,face%cosy)
+        prim_g = prim_w
+        prim = LocalFrame(GetPrimary(cell%conVars),face%cosx,face%cosy)
+        prim_g(1) = prim(1)/prim(4)*prim_w(4) !keep consistent pressure inside cell
+
+        !--------------------------------------------------
+        !Calculate collision time and some time integration terms
+        !--------------------------------------------------
+        tau = GetTau(prim_g)
+
+        Mt(4) = tau*(1.0-exp(-dt/tau))
+        Mt(5) = -tau*dt*exp(-dt/tau)+tau*Mt(4)
+        Mt(1) = dt-Mt(4)
+        Mt(2) = -tau*Mt(1)+Mt(5) 
+        Mt(3) = 0.5*dt**2-tau*Mt(1)
+
+        !--------------------------------------------------
+        !1. Calculate Maxwellian distribution and Shakhov part at g_{i+1/2}
+        !--------------------------------------------------
+        if(UnifiedPhysicalOperators)then
+            call PrepareNativeFaceEquilibrium(H_g_vec,B_g_vec,vn_vec,vt_vec,prim_g)
+        else
+        do k=1,Nvel
+            H_g_vec(k)=prim_g(1)*(prim_g(4)/PI)*exp(-prim_g(4)* &
+                ((vn_vec(k)-prim_g(2))**2+(vt_vec(k)-prim_g(3))**2))
+            B_g_vec(k)=H_g_vec(k)*real(CK,KREAL)/(2.0_KREAL*prim_g(4))
+        enddo
+        endif
+
+        qf = GetHeatFlux_LocalVec(h_vec,b_vec,vn_vec,vt_vec,prim_g)
+        call ShakhovPart_LocalVec(H_g_vec,B_g_vec,vn_vec,vt_vec,qf,prim_g,H_plus_vec,B_plus_vec)
+
+        !--------------------------------------------------
+        !2. Spatial slope a_g: derived from local gradients
+        !--------------------------------------------------
+        !sw = LocalFrame(cell%sw(:,idx), face%cosx, face%cosy) 
+        !a_g  = MicroSlope(prim_g, sw)
+        
+        !Alternative: derived from difference between cell center and interface
+        conVars_g = GetConserved(prim_g)
+        conVars_g1 = LocalFrame(cell%conVars, face%cosx, face%cosy)
+        sw = (conVars_g - conVars_g1) / (side * 0.5 * cell%length(idx))
+        a_gn  = MicroSlope(prim_g, sw)
+        
+        !if (idx == 1) then
+        !    sw_t = LocalFrame(cell%sw(:,2), face%cosx, face%cosy)
+        !else
+        !    sw_t = LocalFrame(-cell%sw(:,1), face%cosx, face%cosy) 
+        !end if
+        
+        !Tangential macro slope obtained by integrating reconstructed VDF slopes.
+        sw_t = 0.0_KREAL
+        do k=1,Nvel
+            wk  = wVel(k)
+            vnK = vn_vec(k)
+            vtK = vt_vec(k)
+            v2  = vnK*vnK+vtK*vtK
+
+            sw_t(1) = sw_t(1)+wk*sht_vec(k)
+            sw_t(2) = sw_t(2)+wk*vnK*sht_vec(k)
+            sw_t(3) = sw_t(3)+wk*vtK*sht_vec(k)
+            sw_t(4) = sw_t(4)+0.5_KREAL*wk*(v2*sht_vec(k)+sbt_vec(k))
+        enddo
+
+        a_gt = MicroSlope(prim_g, sw_t)
+        !--------------------------------------------------
+        !3. Temporal slope a_T
+        !--------------------------------------------------
+        call CalcMoment(prim_g, Mu, Mv, Mxi, MuL, MuR)
+        Mau = Moment_auvxi(a_gn, Mu, Mv, Mxi, 1, 0) 
+        Mbv = Moment_auvxi(a_gt, Mu, Mv, Mxi, 0, 1)
+        sw = -prim_g(1)*(Mau + Mbv) 
+        a_T = MicroSlope(prim_g, sw)
+        
+        !--------------------------------------------------
+        !4. Prepare expansion terms for Flux calculation
+        !--------------------------------------------------
+        !Ha_gn = (a_gn(1) + a_gn(2)*vn + a_gn(3)*vt)*H_g + 0.5*a_gn(4)*((vn**2+vt**2)*H_g + B_g)
+        !Ba_gn = (a_gn(1) + a_gn(2)*vn + a_gn(3)*vt)*B_g + 0.5*a_gn(4)*((vn**2+vt**2)*B_g + Mxi(2)*H_g)
+        !Ha_gt = (a_gt(1) + a_gt(2)*vn + a_gt(3)*vt)*H_g + 0.5*a_gt(4)*((vn**2+vt**2)*H_g + B_g)
+        !Ba_gt = (a_gt(1) + a_gt(2)*vn + a_gt(3)*vt)*B_g + 0.5*a_gt(4)*((vn**2+vt**2)*B_g + Mxi(2)*H_g)
+        !Ha_T  = (a_T(1) + a_T(2)*vn + a_T(3)*vt)*H_g + 0.5*a_T(4)*((vn**2+vt**2)*H_g + B_g)
+        !Ba_T  = (a_T(1) + a_T(2)*vn + a_T(3)*vt)*B_g + 0.5*a_T(4)*((vn**2+vt**2)*B_g + Mxi(2)*H_g)
+        
+
+        if (side == Lside) then
+            Mu = MuR
+        else
+            Mu = MuL
+        end if
+
+        Mau0 = Moment_uvxi(Mu,Mv,Mxi,1,0,0) !<u*\psi>
+        Mau = Moment_auvxi(a_gn,Mu,Mv,Mxi,2,0) !<a*u^2*\psi>
+        Mbv  = Moment_auvxi(a_gt,Mu,Mv,Mxi,1,1) !<b*u*v*\psi>
+        MauT = Moment_auvxi(a_T,Mu,Mv,Mxi,1,0) !<A*u*\psi>
+        
+        ! flux of Maxwellian part
+        flux = Mt(1)*prim_g(1)*Mau0+Mt(2)*prim_g(1)*(Mau+Mbv)+Mt(3)*prim_g(1)*MauT
+        !--------------------------------------------------
+        !Calculate wall density and Maxwellian distribution
+        !--------------------------------------------------
+        
+        !incidence = Mt(1)*sum(weight*vn*(H_g+H_plus)*(1-delta)) + &
+        !            Mt(2)*sum(weight*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + & 
+        !            Mt(3)*sum(weight*vn*Ha_T*(1-delta)) + &      
+        !            Mt(4)*sum(weight*vn*h*(1-delta)) - &
+        !            Mt(5)*sum(weight*vn*(vn*shn + vt*sht)*(1-delta))
+        
+        ! Unit-density outgoing shapes use exactly the same low-order preparation.
+        ! Wall density still comes only from the original zero-mass-flux equation.
+        if(UnifiedPhysicalOperators)then
+            prim_shape=prim_w;prim_shape(1)=1.0_KREAL
+            call PrepareNativeFaceEquilibrium(H_w_vec,B_w_vec,vn_vec,vt_vec,prim_shape)
+        endif
+        !Compute wall incidence/reflection using 1D velocity views.
+        incidence  = 0.0_KREAL
+        reflection = 0.0_KREAL
+        do k=1,Nvel
+            wk      = wVel(k)
+            vnK     = vn_vec(k)
+            vtK     = vt_vec(k)
+            deltaK  = delta_vec(k)
+            inflowK = 1.0_KREAL-deltaK
+            slope_hK = vnK*shn_vec(k)+vtK*sht_vec(k)
+            wallExpK = exp(-prim_w(4)*((vnK-prim_w(2))*(vnK-prim_w(2))+(vtK-prim_w(3))*(vtK-prim_w(3))))
+
+            Ha_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*H_g_vec(k) &
+                +0.5_KREAL*a_gn(4)*((vnK*vnK+vtK*vtK)*H_g_vec(k)+B_g_vec(k))
+            Ha_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*H_g_vec(k) &
+                +0.5_KREAL*a_gt(4)*((vnK*vnK+vtK*vtK)*H_g_vec(k)+B_g_vec(k))
+            Ha_TK = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*H_g_vec(k) &
+                +0.5_KREAL*a_T(4)*((vnK*vnK+vtK*vtK)*H_g_vec(k)+B_g_vec(k))
+            incidence = incidence+wk*vnK*inflowK*(Mt(1)*(H_g_vec(k)+H_plus_vec(k)) &
+                +Mt(2)*(vnK*Ha_gnK+vtK*Ha_gtK)+Mt(3)*Ha_TK+Mt(4)*h_vec(k)-Mt(5)*slope_hK)
+            if(UnifiedPhysicalOperators)wallExpK=H_w_vec(k)
+            reflection = reflection+wk*vnK*wallExpK*deltaK
+        enddo
+        if(UnifiedPhysicalOperators)then
+            reflection=dt*reflection
+        else
+            reflection=dt*(prim_w(4)/PI)*reflection
+        endif
+        prim_w(1) = -incidence/reflection
+
+        if(UnifiedPhysicalOperators)then
+            H_w_vec=prim_w(1)*H_w_vec
+            B_w_vec=prim_w(1)*B_w_vec
+        else
+        do k=1,Nvel
+            H_w_vec(k)=prim_w(1)*(prim_w(4)/PI)*exp(-prim_w(4)* &
+                ((vn_vec(k)-prim_w(2))**2+(vt_vec(k)-prim_w(3))**2))
+            B_w_vec(k)=H_w_vec(k)*real(CK,KREAL)/(2.0_KREAL*prim_w(4))
+        enddo
+        endif
+
+        !--------------------------------------------------
+        ! Calculate Fluxes 
+        !--------------------------------------------------
+        ! 1. Mass Flux
+        !flux(1) = dt*sum(weight*vn*H_w*delta) + &
+        !          Mt(1)*sum(weight*vn*(H_g+H_plus)*(1-delta)) + &
+        !          Mt(2)*sum(weight*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta))+ &   
+        !          Mt(3)*sum(weight*vn*Ha_T*(1-delta)) + &        
+        !          Mt(4)*sum(weight*vn*h*(1-delta)) - &
+        !          Mt(5)*sum(weight*vn*(vn*shn + vt*sht)*(1-delta)) 
+        !Accumulate reflected and incident macro flux corrections through 1D velocity views.
+        flux_wall = 0.0_KREAL
+        do k=1,Nvel
+            wk      = wVel(k)
+            vnK     = vn_vec(k)
+            vtK     = vt_vec(k)
+            v2      = vnK*vnK+vtK*vtK
+            deltaK  = delta_vec(k)
+            inflowK = 1.0_KREAL-deltaK
+
+            H_wK     = H_w_vec(k)
+            B_wK     = B_w_vec(k)
+            H_plusK  = H_plus_vec(k)
+            B_plusK  = B_plus_vec(k)
+            hK       = h_vec(k)
+            bK       = b_vec(k)
+            slope_hK = vnK*shn_vec(k)+vtK*sht_vec(k)
+            slope_bK = vnK*sbn_vec(k)+vtK*sbt_vec(k)
+
+            flux_wall(1) = flux_wall(1)+wk*vnK*(dt*H_wK*deltaK+Mt(1)*H_plusK*inflowK+ &
+                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
+            flux_wall(2) = flux_wall(2)+wk*vnK*vnK*(dt*H_wK*deltaK+Mt(1)*H_plusK*inflowK+ &
+                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
+            flux_wall(3) = flux_wall(3)+wk*vnK*vtK*(dt*H_wK*deltaK+Mt(1)*H_plusK*inflowK+ &
+                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
+            flux_wall(4) = flux_wall(4)+0.5_KREAL*wk*vnK*(dt*(v2*H_wK+B_wK)*deltaK+ &
+                Mt(1)*(v2*H_plusK+B_plusK)*inflowK+Mt(4)*(v2*hK+bK)*inflowK- &
+                Mt(5)*(v2*slope_hK+slope_bK)*inflowK)
+        enddo
+        flux = flux+flux_wall
+
+        ! 2. Normal Momentum Flux
+        !flux(2) = dt*sum(weight*vn*vn*H_w*delta) + &
+        !          Mt(1)*sum(weight*vn*vn*(H_g+H_plus)*(1-delta)) + &
+        !          Mt(2)*sum(weight*vn*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + & 
+        !          Mt(3)*sum(weight*vn*vn*Ha_T*(1-delta)) + &     
+        !          Mt(4)*sum(weight*vn*vn*h*(1-delta)) - &
+        !          Mt(5)*sum(weight*vn*vn*(vn*shn + vt*sht)*(1-delta)) 
+        ! The Nvel loop above replaces the four separate macro-flux sum expressions.
+        ! 3. Tangential Momentum Flux
+        !flux(3) = dt*sum(weight*vn*vt*H_w*delta) + &
+        !          Mt(1)*sum(weight*vn*vt*(H_g+H_plus)*(1-delta)) + &
+        !          Mt(2)*sum(weight*vn*vt*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + & 
+        !          Mt(3)*sum(weight*vn*vt*Ha_T*(1-delta)) + &     
+        !          Mt(4)*sum(weight*vt*vn*h*(1-delta)) - &
+        !          Mt(5)*sum(weight*vt*vn*(vn*shn + vt*sht)*(1-delta)) 
+        ! The Nvel loop above replaces the tangential momentum flux sum.
+        ! 4. Energy Flux
+        !flux(4) = dt*0.5*sum(weight*vn*((vn**2+vt**2)*H_w+B_w)*delta)+ &
+        !          Mt(1)*0.5*sum(weight*vn*((vn**2+vt**2)*(H_g+H_plus)+(B_g+B_plus))*(1-delta))+ &
+        !          Mt(2)*0.5*sum(weight*vn*((vn**2+vt**2)*(vn*Ha_gn+vt*Ha_gt)+(vn*Ba_gn+vt*Ba_gt))*(1-delta))+ & 
+        !          Mt(3)*0.5*sum(weight*vn*((vn**2+vt**2)*Ha_T+Ba_T)*(1-delta))+ &      
+        !          Mt(4)*0.5*sum(weight*vn*((vn**2+vt**2)*h+b)*(1-delta)) - &
+        !          Mt(5)*0.5*sum(weight*vn*((vn**2+vt**2)*(vn*shn + vt*sht) + (vn*sbn + vt*sbt))*(1-delta))
+        ! The Nvel loop above replaces the energy flux sum.
+
+
+
+        !flux_h = dt*vn*H_w*delta + &
+        !         Mt(1)*vn*(H_g+H_plus)*(1-delta) + &
+        !         Mt(2)*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta) + &  
+        !         Mt(3)*vn*Ha_T*(1-delta) + &       
+        !         Mt(4)*vn*h*(1-delta) - &
+        !         Mt(5)*vn*(vn*shn + vt*sht)*(1-delta) 
+        
+        !Store multiscale wall micro flux directly through 1D face views.
+        do k=1,Nvel
+            vnK     = vn_vec(k)
+            vtK     = vt_vec(k)
+            v2      = vnK*vnK+vtK*vtK
+            deltaK  = delta_vec(k)
+            inflowK = 1.0_KREAL-deltaK
+
+            H_gK     = H_g_vec(k)
+            B_gK     = B_g_vec(k)
+            H_wK     = H_w_vec(k)
+            B_wK     = B_w_vec(k)
+            H_plusK  = H_plus_vec(k)
+            B_plusK  = B_plus_vec(k)
+            hK       = h_vec(k)
+            bK       = b_vec(k)
+            shnK     = shn_vec(k)
+            sbnK     = sbn_vec(k)
+            shtK     = sht_vec(k)
+            sbtK     = sbt_vec(k)
+
+            Ha_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*H_gK+0.5_KREAL*a_gn(4)*(v2*H_gK+B_gK)
+            Ha_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*H_gK+0.5_KREAL*a_gt(4)*(v2*H_gK+B_gK)
+            Ha_TK  = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*H_gK+0.5_KREAL*a_T(4)*(v2*H_gK+B_gK)
+
+            Ba_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*B_gK+0.5_KREAL*a_gn(4)*(v2*B_gK+Mxi(2)*H_gK)
+            Ba_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*B_gK+0.5_KREAL*a_gt(4)*(v2*B_gK+Mxi(2)*H_gK)
+            Ba_TK  = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*B_gK+0.5_KREAL*a_T(4)*(v2*B_gK+Mxi(2)*H_gK)
+
+            if(side==Lside) then
+                face%L_flux_h_vec(k) = face%length*(dt*vnK*H_wK*deltaK + &
+                    Mt(1)*vnK*(H_gK+H_plusK)*inflowK + Mt(2)*vnK*vnK*Ha_gnK*inflowK + &
+                    Mt(2)*vnK*vtK*Ha_gtK*inflowK + Mt(3)*vnK*Ha_TK*inflowK + &
+                    Mt(4)*vnK*hK*inflowK - Mt(5)*vnK*(vnK*shnK+vtK*shtK)*inflowK)
+
+                face%L_flux_b_vec(k) = face%length*(dt*vnK*B_wK*deltaK + &
+                    Mt(1)*vnK*(B_gK+B_plusK)*inflowK + Mt(2)*vnK*vnK*Ba_gnK*inflowK + &
+                    Mt(2)*vnK*vtK*Ba_gtK*inflowK + Mt(3)*vnK*Ba_TK*inflowK + &
+                    Mt(4)*vnK*bK*inflowK - Mt(5)*vnK*(vnK*sbnK+vtK*sbtK)*inflowK)
+            elseif(side==Rside) then
+                face%R_flux_h_vec(k) = face%length*(dt*vnK*H_wK*deltaK + &
+                    Mt(1)*vnK*(H_gK+H_plusK)*inflowK + Mt(2)*vnK*vnK*Ha_gnK*inflowK + &
+                    Mt(2)*vnK*vtK*Ha_gtK*inflowK + Mt(3)*vnK*Ha_TK*inflowK + &
+                    Mt(4)*vnK*hK*inflowK - Mt(5)*vnK*(vnK*shnK+vtK*shtK)*inflowK)
+
+                face%R_flux_b_vec(k) = face%length*(dt*vnK*B_wK*deltaK + &
+                    Mt(1)*vnK*(B_gK+B_plusK)*inflowK + Mt(2)*vnK*vnK*Ba_gnK*inflowK + &
+                    Mt(2)*vnK*vtK*Ba_gtK*inflowK + Mt(3)*vnK*Ba_TK*inflowK + &
+                    Mt(4)*vnK*bK*inflowK - Mt(5)*vnK*(vnK*sbnK+vtK*sbtK)*inflowK)
+            endif
+        enddo
+        !flux_b = dt*vn*B_w*delta + &
+        !         Mt(1)*vn*(B_g+B_plus)*(1-delta) + &
+        !         Mt(2)*vn*(vn*Ba_gn + vt*Ba_gt)*(1-delta) + &   
+        !         Mt(3)*vn*Ba_T*(1-delta) + &      
+        !         Mt(4)*vn*b*(1-delta) - &
+        !         Mt(5)*vn*(vn*sbn + vt*sbt)*(1-delta) 
+
+        !--------------------------------------------------
+        !Store surface FlowVars and Aerodynamics
+        !--------------------------------------------------
+        !Flow variables
+        
+        !conVars_g0(1) = dt*sum(weight*H_w*delta) + &
+        !                Mt(1)*sum(weight*(H_g+H_plus)*(1-delta)) + &
+        !                Mt(2)*sum(weight*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + &   
+        !                Mt(3)*sum(weight*Ha_T*(1-delta)) + &       
+        !                Mt(4)*sum(weight*h*(1-delta)) - &
+        !                Mt(5)*sum(weight*(vn*shn + vt*sht)*(1-delta)) 
+
+        !conVars_g0(2) = dt*sum(weight*vn*H_w*delta) + &
+        !                Mt(1)*sum(weight*vn*(H_g+H_plus)*(1-delta)) + &
+        !                Mt(2)*sum(weight*vn*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + &
+        !                Mt(3)*sum(weight*vn*Ha_T*(1-delta)) + &    
+        !                Mt(4)*sum(weight*vn*h*(1-delta)) - &
+        !                Mt(5)*sum(weight*vn*(vn*shn + vt*sht)*(1-delta)) 
+
+        !conVars_g0(3) = dt*sum(weight*vt*H_w*delta) + &
+        !                Mt(1)*sum(weight*vt*(H_g+H_plus)*(1-delta)) + &
+        !                Mt(2)*sum(weight*vt*(vn*Ha_gn + vt*Ha_gt)*(1-delta)) + &
+        !                Mt(3)*sum(weight*vt*Ha_T*(1-delta)) + &    
+        !                Mt(4)*sum(weight*vt*h*(1-delta)) - &
+        !                Mt(5)*sum(weight*vt*(vn*shn + vt*sht)*(1-delta)) 
+
+        !conVars_g0(4) = dt*0.5*sum(weight*((vn**2+vt**2)*H_w+B_w)*delta)+ &
+        !                Mt(1)*0.5*sum(weight*((vn**2+vt**2)*(H_g+H_plus)+(B_g+B_plus))*(1-delta))+ &
+        !                Mt(2)*0.5*sum(weight*((vn**2+vt**2)*(vn*Ha_gn + vt*Ha_gt) + (vn*Ba_gn + vt*Ba_gt))*(1-delta))+ &
+        !                Mt(3)*0.5*sum(weight*((vn**2+vt**2)*Ha_T+Ba_T)*(1-delta))+ &      
+        !                Mt(4)*0.5*sum(weight*((vn**2+vt**2)*h+b)*(1-delta)) - &
+        !                Mt(5)*0.5*sum(weight*((vn**2+vt**2)*(vn*shn + vt*sht) + (vn*sbn + vt*sbt))*(1-delta))
+
+        ! Macro from the exact same time-and-length integrated micro flux.
+        flux=0.0_KREAL
+        do k=1,Nvel
+            if(side==Lside)then
+                hK=face%L_flux_h_vec(k)/face%length
+                bK=face%L_flux_b_vec(k)/face%length
+            else
+                hK=face%R_flux_h_vec(k)/face%length
+                bK=face%R_flux_b_vec(k)/face%length
+            endif
+            flux=flux+wVel(k)*[hK,vn_vec(k)*hK,vt_vec(k)*hK, &
+                0.5_KREAL*((vn_vec(k)**2+vt_vec(k)**2)*hK+bK)]
+        enddo
+        !Build wall output conserved variables through a single 1D velocity loop.
+        conVars_g0 = 0.0_KREAL
+        do k=1,Nvel
+            wk      = wVel(k)
+            vnK     = vn_vec(k)
+            vtK     = vt_vec(k)
+            v2      = vnK*vnK+vtK*vtK
+            deltaK  = delta_vec(k)
+            inflowK = 1.0_KREAL-deltaK
+
+            H_gK     = H_g_vec(k)
+            B_gK     = B_g_vec(k)
+            H_wK     = H_w_vec(k)
+            B_wK     = B_w_vec(k)
+            H_plusK  = H_plus_vec(k)
+            B_plusK  = B_plus_vec(k)
+            hK       = h_vec(k)
+            bK       = b_vec(k)
+            slope_hK = vnK*shn_vec(k)+vtK*sht_vec(k)
+            slope_bK = vnK*sbn_vec(k)+vtK*sbt_vec(k)
+
+            Ha_gnK = (a_gn(1)+a_gn(2)*vnK+a_gn(3)*vtK)*H_gK+0.5_KREAL*a_gn(4)*(v2*H_gK+B_gK)
+            Ha_gtK = (a_gt(1)+a_gt(2)*vnK+a_gt(3)*vtK)*H_gK+0.5_KREAL*a_gt(4)*(v2*H_gK+B_gK)
+            Ha_TK  = (a_T(1)+a_T(2)*vnK+a_T(3)*vtK)*H_gK+0.5_KREAL*a_T(4)*(v2*H_gK+B_gK)
+
+            conVars_g0(1) = conVars_g0(1)+wk*(dt*H_wK*deltaK+Mt(1)*(H_gK+H_plusK)*inflowK+ &
+                Mt(2)*vnK*Ha_gnK*inflowK+Mt(2)*vtK*Ha_gtK*inflowK+Mt(3)*Ha_TK*inflowK+ &
+                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
+            conVars_g0(2) = conVars_g0(2)+wk*vnK*(dt*H_wK*deltaK+Mt(1)*(H_gK+H_plusK)*inflowK+ &
+                Mt(2)*vnK*Ha_gnK*inflowK+Mt(2)*vtK*Ha_gtK*inflowK+Mt(3)*Ha_TK*inflowK+ &
+                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
+            conVars_g0(3) = conVars_g0(3)+wk*vtK*(dt*H_wK*deltaK+Mt(1)*(H_gK+H_plusK)*inflowK+ &
+                Mt(2)*vnK*Ha_gnK*inflowK+Mt(2)*vtK*Ha_gtK*inflowK+Mt(3)*Ha_TK*inflowK+ &
+                Mt(4)*hK*inflowK-Mt(5)*slope_hK*inflowK)
+
+            !Keep the historical conVars_g0(4) algebra exactly; do not substitute the commented formula here.
+            conVars_g0(4) = conVars_g0(4)+0.5_KREAL*wk*(dt*(v2*H_wK+B_wK)*deltaK+ &
+                Mt(1)*(v2*(H_gK+H_plusK)+(B_gK+B_plusK))*inflowK+ &
+                Mt(2)*vnK*(v2*Ha_gnK+Ha_gtK*vtK)*inflowK+ &
+                Mt(2)*vtK*(v2*Ha_gnK+Ha_gtK*vtK)*inflowK+Mt(3)*v2*Ha_TK*inflowK+ &
+                Mt(4)*(v2*hK+bK)*inflowK-Mt(5)*(v2*slope_hK+slope_bK)*inflowK)
+        enddo
+        
+
+        prim_g0       = GlobalFrame(GetPrimary(conVars_g0/dt),face%cosx,face%cosy)
+        face%FlowVars(1:3)   = prim_g0(1:3)                         !density,u,v
+        face%FlowVars(4)     = 1.0/prim_g0(4)                       !temperature
+        face%FlowVars(5)     = 0.5*prim_g0(1)/prim_g0(4)            !pressure
+        !Aerodynamics (Notice: here assume Unw==0, i.e. prim_w(2)==0)
+        face%Aerodynamics(1) = flux(2)/dt                           !pnn: pressure
+        face%Aerodynamics(2) = flux(3)/dt                           !pnt: shear stress
+        face%Aerodynamics(3) = flux(4)/dt-prim_w(3)*flux(3)/dt      !qn:  heat flux
+
+        !--------------------------------------------------
+        !Final flux
+        !--------------------------------------------------
+        !Convert to global frame
+        
+        flux = GlobalFrame(flux,face%cosx,face%cosy)
+
+        !Total flux
+        flux = face%length*flux
+
+        if(side==Lside) then
+            face%L_flux     = flux
+        elseif(side==Rside) then
+            face%R_flux     = flux
+        endif
+        
+        !--------------------------------------------------
+        !Aftermath
+        !--------------------------------------------------
+        !Release pure 1D velocity-space temporaries allocated above.
+        deallocate(vn_vec)
+        deallocate(vt_vec)
+        deallocate(delta_vec)
+        deallocate(h_vec)
+        deallocate(b_vec)
+        deallocate(H_g_vec)
+        deallocate(B_g_vec)
+        deallocate(H_w_vec)
+        deallocate(B_w_vec)
+        deallocate(H_plus_vec)
+        deallocate(B_plus_vec)
+        deallocate(shn_vec)
+        deallocate(sbn_vec)
+        !deallocate(Ha_gn); deallocate(Ba_gn)
+        !deallocate(Ha_gt); deallocate(Ba_gt)
+        !deallocate(Ha_T); deallocate(Ba_T)
+        deallocate(sht_vec)
+        deallocate(sbt_vec)
+    end subroutine W2BMultiscaleFluxBoundary
+
 end module mod_Evolution

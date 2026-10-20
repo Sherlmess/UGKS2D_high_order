@@ -1,0 +1,476 @@
+{
+  "low_implicit": {
+    "bitwise_modes": [
+      "sparse",
+      "audit",
+      "finalbuild",
+      "resume"
+    ],
+    "files_compared": [
+      "flow2d.dat",
+      "vdf2d.dat",
+      "closed_mass_rank0.bin",
+      "closed_mass_rank1.bin",
+      "closed_mass_rank2.bin",
+      "closed_mass_rank3.bin",
+      "closed_mass_rank4.bin",
+      "closed_mass_rank5.bin",
+      "closed_mass_rank6.bin",
+      "closed_mass_rank7.bin"
+    ],
+    "residual_and_wall_rows_exact": true,
+    "directory_MiB": 26.962193489074707,
+    "rolling_restart_MiB": 26.0533390045166
+  },
+  "high_implicit": {
+    "bitwise_modes": [
+      "sparse",
+      "audit",
+      "finalbuild",
+      "resume"
+    ],
+    "files_compared": [
+      "flow2d.dat",
+      "vdf2d.dat",
+      "closed_mass_rank0.bin",
+      "closed_mass_rank1.bin",
+      "closed_mass_rank2.bin",
+      "closed_mass_rank3.bin",
+      "closed_mass_rank4.bin",
+      "closed_mass_rank5.bin",
+      "closed_mass_rank6.bin",
+      "closed_mass_rank7.bin"
+    ],
+    "residual_and_wall_rows_exact": true,
+    "directory_MiB": 26.969544410705566,
+    "rolling_restart_MiB": 26.0533390045166
+  },
+  "low_explicit": {
+    "bitwise_modes": [
+      "sparse",
+      "audit"
+    ],
+    "files_compared": [
+      "flow2d.dat",
+      "vdf2d.dat"
+    ]
+  },
+  "final_between_intervals": true,
+  "controlled_stop_no_state_change": true,
+  "negative_frequency_rejected_before_initialization": true,
+  "protected_files_unchanged": 107,
+  "changed_source": [
+    "src/mod_ClosedCouetteMass.f90",
+    "src/mod_Globaldata.f90",
+    "src/mod_Output.f90",
+    "src/mod_ImportPara.f90",
+    "src/mod_R5Observe.f90",
+    "src/mod_Solve.f90",
+    "Makefile"
+  ],
+  "PR_micro_flux_collision_sources_unchanged": true,
+  "runs": {
+    "high_implicit_resume": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 2,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "1",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        },
+        "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/checks/runs/high_implicit_prefix"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 2.976113
+    },
+    "low_explicit_old": {
+      "spec": {
+        "method": "low_explicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "1"
+        },
+        "baseline": true,
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.237724375
+    },
+    "high_implicit_finalbuild": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 4.172972000000001
+    },
+    "low_explicit_audit": {
+      "spec": {
+        "method": "low_explicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "1",
+          "Nstep_monitor": "1"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.290956708
+    },
+    "high_implicit_prefix": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 2,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "1",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 2.109871459
+    },
+    "high_implicit_audit": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "1",
+          "Nstep_monitor": "1"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 3.990660792
+    },
+    "low_implicit_finalbuild": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.549211583
+    },
+    "low_stopped": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 3,
+        "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/checks/runs/low_implicit_prefix",
+        "env": {
+          "R5_WALL_LIMIT": "0"
+        },
+        "settings": {
+          "Nstep_restart": "0",
+          "Nstep_audit": "0"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.178057084
+    },
+    "high_implicit_sparse": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 3.881735541
+    },
+    "high_finalonly": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 3,
+        "settings": {
+          "Nstep_show": "100",
+          "Nstep_write": "100",
+          "Nstep_restart": "0",
+          "Nstep_monitor": "2",
+          "Nstep_audit": "0"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 3.815912291
+    },
+    "low_implicit_old": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "1"
+        },
+        "baseline": true,
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.840652292
+    },
+    "low_implicit_audit": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "1",
+          "Nstep_monitor": "1"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.718598542
+    },
+    "low_implicit_prefix": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 2,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "1",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.5123595409999999
+    },
+    "low_implicit_resume": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 2,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "1",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        },
+        "restart": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/checks/runs/low_implicit_prefix"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.396130875
+    },
+    "invalid_frequency": {
+      "spec": {
+        "method": "low_explicit",
+        "steps": 1,
+        "settings": {
+          "Nstep_restart": "-1"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 200,
+      "wall_s": 0.6135789580000001
+    },
+    "low_explicit_sparse": {
+      "spec": {
+        "method": "low_explicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 0.284891833
+    },
+    "high_implicit_old": {
+      "spec": {
+        "method": "high_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "1"
+        },
+        "baseline": true,
+        "binary": "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/vl_wall_balance_r1_20261014T141628Z/candidate/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 4.169784916999999
+    },
+    "low_implicit_sparse": {
+      "spec": {
+        "method": "low_implicit",
+        "steps": 4,
+        "settings": {
+          "Nstep_show": "2",
+          "Nstep_write": "3",
+          "Nstep_restart": "2",
+          "Nstep_audit": "0",
+          "Nstep_monitor": "2"
+        }
+      },
+      "argv": [
+        "mpirun",
+        "--oversubscribe",
+        "-np",
+        "8",
+        "/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/couette_output_r1_20261015T001737Z/Couette_3Methods_IO_R1/bin/ugks_solver"
+      ],
+      "exit": 0,
+      "wall_s": 1.536492958
+    }
+  },
+  "MPI_process_wall_s": 32.275704749
+}

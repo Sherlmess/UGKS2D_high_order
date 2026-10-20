@@ -1,0 +1,40 @@
+{
+  "parameter_differences": {
+    "high_implicit": {},
+    "low_implicit": {
+      "TimeIntegration_method": [
+        "'HighOrderImplicit'",
+        "'ImplicitSteady'"
+      ]
+    },
+    "low_explicit": {
+      "TimeIntegration_method": [
+        "'HighOrderImplicit'",
+        "'Explicit'"
+      ],
+      "ClosedCouetteMassRescale": [
+        ".true.",
+        ".false."
+      ],
+      "MAX_ITER": [
+        "3000",
+        "200000"
+      ],
+      "Nstep_write": [
+        "100",
+        "1000"
+      ]
+    }
+  },
+  "syntax": "PASS",
+  "mock_submit_launch_exit_tests": [
+    "high_implicit",
+    "low_implicit",
+    "low_explicit"
+  ],
+  "source_identical": true,
+  "protected_files": 90,
+  "native_numeric_calls": 0,
+  "checkpoint_and_profile_bytes_per_step": 27468984,
+  "upper_3000_steps_GiB": 76.74745470285416
+}

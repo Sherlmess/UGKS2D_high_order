@@ -45,9 +45,7 @@ contains
         integer(KINT) :: i,j
         real(KREAL) :: prim_old(4),prim_tilde(4),h_plus(Nvel),b_plus(Nvel)
         real(KREAL) :: reference_h(Nvel),reference_b(Nvel)
-        real(KREAL) :: old_equilibrium_h(Nvel),old_equilibrium_b(Nvel)
-        real(KREAL) :: old_reference_h(Nvel),old_reference_b(Nvel)
-        logical :: projection_ok
+        logical :: projection_ok,old_projection_ok
         logical :: local_ok,global_ok
 
         local_ok=.true.
@@ -56,11 +54,7 @@ contains
                 prim_old=GetPrimary(ctr(i,j)%conVars)
                 q_frozen(:,i,j)=GetHeatFlux_Vec(ctr(i,j)%h_vec,ctr(i,j)%b_vec,prim_old)
                 prim_tilde=GetPrimary(w_tilde(:,i,j))
-                if(s2_steady_rhs)then
-                    tau_tilde(i,j)=0.1_KREAL
-                else
-                    tau_tilde(i,j)=GetTau(prim_tilde)
-                endif
+                tau_tilde(i,j)=GetTau(prim_tilde)
                 call DiscreteMaxwell_Vec(equilibrium_h(:,i,j),equilibrium_b(:,i,j),prim_tilde)
                 call ShakhovPart_Vec(equilibrium_h(:,i,j),equilibrium_b(:,i,j),q_frozen(:,i,j), &
                                      prim_tilde,h_plus,b_plus)
@@ -69,19 +63,19 @@ contains
                 reference_h=equilibrium_h(:,i,j); reference_b=equilibrium_b(:,i,j)
                 call ProjectToConservedMoments(equilibrium_h(:,i,j),equilibrium_b(:,i,j), &
                     w_tilde(:,i,j),uVel,vVel,wVel,reference_h,reference_b,projection_ok)
-                if(s2_steady_rhs.and.projection_ok)then
-                    call DiscreteMaxwell_Vec(old_equilibrium_h,old_equilibrium_b,prim_old)
-                    call ShakhovPart_Vec(old_equilibrium_h,old_equilibrium_b,q_frozen(:,i,j), &
-                        prim_old,h_plus,b_plus)
-                    old_equilibrium_h=old_equilibrium_h+h_plus
-                    old_equilibrium_b=old_equilibrium_b+b_plus
-                    old_reference_h=old_equilibrium_h;old_reference_b=old_equilibrium_b
-                    call ProjectToConservedMoments(old_equilibrium_h,old_equilibrium_b, &
-                        ctr(i,j)%conVars,uVel,vVel,wVel,old_reference_h,old_reference_b,projection_ok)
-                    if(projection_ok)then
-                        equilibrium_increment_h(:,i,j)=equilibrium_h(:,i,j)-old_equilibrium_h
-                        equilibrium_increment_b(:,i,j)=equilibrium_b(:,i,j)-old_equilibrium_b
-                    endif
+                if(IsHighOrderImplicit())then
+                    call DiscreteMaxwell_Vec(reference_h,reference_b,prim_old)
+                    call ShakhovPart_Vec(reference_h,reference_b,q_frozen(:,i,j),prim_old,h_plus,b_plus)
+                    reference_h=reference_h+h_plus;reference_b=reference_b+b_plus
+                    block
+                        real(KREAL)::rh(Nvel),rb(Nvel)
+                        rh=reference_h;rb=reference_b
+                        call ProjectToConservedMoments(reference_h,reference_b,ctr(i,j)%conVars, &
+                            uVel,vVel,wVel,rh,rb,old_projection_ok)
+                    end block
+                    local_ok=local_ok.and.old_projection_ok
+                    low_collision_old_h(:,i,j)=(reference_h-ctr(i,j)%h_vec)/GetTau(prim_old)
+                    low_collision_old_b(:,i,j)=(reference_b-ctr(i,j)%b_vec)/GetTau(prim_old)
                 endif
                 local_ok=local_ok .and. tau_tilde(i,j)>0.0_KREAL .and. &
                     projection_ok .and. &
@@ -384,6 +378,7 @@ contains
         freeze_wall_closure_active=.false.
         if (present(freeze_wall_closure)) freeze_wall_closure_active=freeze_wall_closure
         do sweep=1,Implicit_MicroSweeps
+            r4_forward_scans=r4_forward_scans+1
             local_ok=.true.
             start_stage=MPI_Wtime()
             do j=1,ny
@@ -411,8 +406,8 @@ contains
             implicit_micro_forward_backward_exchange_seconds= &
                 implicit_micro_forward_backward_exchange_seconds+MPI_Wtime()-start_stage
             implicit_micro_exchange_calls=implicit_micro_exchange_calls+1
-            if(s2_steady_rhs)call RecordR1MicroForward(sweep)
             start_stage=MPI_Wtime()
+            r4_backward_scans=r4_backward_scans+1
             do j=ny,1,-1
                 do i=nx,1,-1
                     if (freeze_wall_closure_active) then
@@ -446,33 +441,6 @@ contains
         ok=.true.
     end subroutine SolveMicroLUSGS
 
-    subroutine RecordR1MicroForward(sweep)
-        integer,intent(in)::sweep
-        real(KREAL)::mom(4),tot(4),hdef,bdef
-        integer::i,j,env_status,fu
-        character(len=8)::env_value
-        logical,save::opened=.false.
-        env_value=''
-        call get_environment_variable('S2I1_R1_DIAG',env_value,status=env_status)
-        if(env_status/=0.or.trim(env_value)/='1')return
-        tot=0.0_KREAL
-        do j=1,ny;do i=1,nx
-            call MomentConserved(delta_h(:,i,j),delta_b(:,i,j),uVel,vVel,wVel,mom)
-            tot=tot+ctr(i,j)%area*mom
-        enddo;enddo
-        call ComputeMicroDefectNorm(hdef,bdef)
-        if(myID==0)then
-            if(.not.opened)then
-                open(newunit=fu,file='s2i1_micro_forward.csv',status='replace',action='write')
-                write(fu,'(A)')'iter,retry,sweep,dMf_sum1,dMf_sum2,dMf_sum3,dMf_sum4,h_linear_defect,b_linear_defect'
-                close(fu);opened=.true.
-            endif
-            open(newunit=fu,file='s2i1_micro_forward.csv',status='old',position='append',action='write')
-            write(fu,'(I0,",",I0,",",I0,6(",",ES24.16))')iter,implicit_retry_count,sweep,tot,hdef,bdef
-            close(fu)
-        endif
-    end subroutine RecordR1MicroForward
-
     subroutine RelaxMicroPoint(i,j,k,ok,physical_dt,flux_weight,collision_weight,wall_state)
         integer(KINT), intent(in) :: i,j,k
         logical, intent(out) :: ok
@@ -494,17 +462,11 @@ contains
             stream_coefficient=1.0_KREAL
             collision_coefficient=1.0_KREAL
             dt_pseudo=PseudoTimeStep(ctr(i,j)%dt_local,implicit_ncfl_active,CFL)
-            if(s2_steady_rhs)then
-                if(s2_steady_coupling_on)then
-                    rhs_h=stream_h(k,i,j)+equilibrium_increment_h(k,i,j)/tau_tilde(i,j)
-                    rhs_b=stream_b(k,i,j)+equilibrium_increment_b(k,i,j)/tau_tilde(i,j)
-                else
-                    rhs_h=stream_h(k,i,j)
-                    rhs_b=stream_b(k,i,j)
-                endif
-            else
-                rhs_h=stream_h(k,i,j)+(equilibrium_h(k,i,j)-ctr(i,j)%h_vec(k))/tau_tilde(i,j)
-                rhs_b=stream_b(k,i,j)+(equilibrium_b(k,i,j)-ctr(i,j)%b_vec(k))/tau_tilde(i,j)
+            rhs_h=stream_h(k,i,j)+(equilibrium_h(k,i,j)-ctr(i,j)%h_vec(k))/tau_tilde(i,j)
+            rhs_b=stream_b(k,i,j)+(equilibrium_b(k,i,j)-ctr(i,j)%b_vec(k))/tau_tilde(i,j)
+            if(IsHighOrderImplicit())then
+                rhs_h=rhs_h+physical_collision_h(k,i,j)-low_collision_old_h(k,i,j)
+                rhs_b=rhs_b+physical_collision_b(k,i,j)-low_collision_old_b(k,i,j)
             endif
             diagonal=1.0_KREAL/dt_pseudo+1.0_KREAL/tau_tilde(i,j)
         endif
@@ -573,6 +535,13 @@ contains
             dt_pseudo,tau_value])) .or. dt_pseudo<=0.0_KREAL .or. tau_value<=0.0_KREAL) return
 
         collision_rhs=(equilibrium_value-current_value)/tau_value
+        if(IsHighOrderImplicit())then
+            if(is_h)then
+                collision_rhs=collision_rhs+physical_collision_h(k,i,j)-low_collision_old_h(k,i,j)
+            else
+                collision_rhs=collision_rhs+physical_collision_b(k,i,j)-low_collision_old_b(k,i,j)
+            endif
+        endif
         area=ctr(i,j)%area
         if (.not.ieee_is_finite(area) .or. area<=0.0_KREAL) return
         neighbor_rhs=0.0_KREAL
@@ -617,18 +586,17 @@ contains
         dt_pseudo=PseudoTimeStep(ctr(i,j)%dt_local,implicit_ncfl_active,CFL)
         if (is_h) then
             rhs=stream_h(k,i,j)+(equilibrium_h(k,i,j)-ctr(i,j)%h_vec(k))/tau_tilde(i,j)
-            if(s2_steady_rhs)then
-                rhs=stream_h(k,i,j)
-                if(s2_steady_coupling_on)rhs=rhs+equilibrium_increment_h(k,i,j)/tau_tilde(i,j)
-            endif
             current_delta=delta_h(k,i,j)
         else
             rhs=stream_b(k,i,j)+(equilibrium_b(k,i,j)-ctr(i,j)%b_vec(k))/tau_tilde(i,j)
-            if(s2_steady_rhs)then
-                rhs=stream_b(k,i,j)
-                if(s2_steady_coupling_on)rhs=rhs+equilibrium_increment_b(k,i,j)/tau_tilde(i,j)
-            endif
             current_delta=delta_b(k,i,j)
+        endif
+        if(IsHighOrderImplicit())then
+            if(is_h)then
+                rhs=rhs+physical_collision_h(k,i,j)-low_collision_old_h(k,i,j)
+            else
+                rhs=rhs+physical_collision_b(k,i,j)-low_collision_old_b(k,i,j)
+            endif
         endif
         lhs=current_delta*(1.0_KREAL/dt_pseudo+1.0_KREAL/tau_tilde(i,j))
         do face_number=1,4
@@ -731,11 +699,11 @@ contains
             endif
             !Build the complete wall correction once; all velocity points in this cell sweep reuse it.
             if (FluxWall_type==FluxWall_Maxwell) then
-                call ComputeMaxwellWallFaceDelta(Prim_wall,nx_out,ny_out,side,ACC, &
+                call ComputeMaxwellWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side,ACC, &
                     delta_h(:,i,j),delta_b(:,i,j),state%delta_h_face(:,face_number), &
                     state%delta_b_face(:,face_number),rho_delta,face_ok)
             else
-                call ComputeDiffuseWallFaceDelta(Prim_wall,nx_out,ny_out,side, &
+                call ComputeDiffuseWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side, &
                     delta_h(:,i,j),delta_b(:,i,j),state%delta_h_face(:,face_number), &
                     state%delta_b_face(:,face_number),rho_delta,face_ok)
             endif
@@ -807,10 +775,10 @@ contains
                 endif
             endif
             if (FluxWall_type==FluxWall_Maxwell) then
-                call ComputeMaxwellWallFaceDelta(Prim_wall,nx_out,ny_out,side,ACC, &
+                call ComputeMaxwellWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side,ACC, &
                     delta_h(:,i,j),delta_b(:,i,j),dh_boundary,db_boundary,rho_delta,ok)
             else
-                call ComputeDiffuseWallFaceDelta(Prim_wall,nx_out,ny_out,side, &
+                call ComputeDiffuseWallFaceDelta(WallPrimary(face_number),nx_out,ny_out,side, &
                     delta_h(:,i,j),delta_b(:,i,j),dh_boundary,db_boundary,rho_delta,ok)
             endif
             if (ok) then

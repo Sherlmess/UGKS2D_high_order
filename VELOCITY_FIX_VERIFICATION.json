@@ -1,0 +1,19 @@
+{
+  "high_implicit": {
+    "four_step_state_bitwise_identical": true
+  },
+  "low_implicit": {
+    "four_step_state_bitwise_identical": true
+  },
+  "low_explicit": {
+    "four_step_state_bitwise_identical": true
+  },
+  "one_ulp_external_weight_old_reject_new_accept": true,
+  "negative_weight_rejected_by_original_reader": true,
+  "generated_table_without_external_file_pass": true,
+  "old_files_unchanged": 212,
+  "changed_Fortran_files": [
+    "mod_S2NativeAdapter.f90"
+  ],
+  "MPI_wall_s": 14.436303415999998
+}
