@@ -224,30 +224,6 @@ contains
     ! Evaluate a companion field with the nonlinear weights frozen from q.
     ! This is the tensor derivative of the same reconstructed expression;
     ! the companion does not compute a second set of WENO weights.
-    subroutine s2d1_weno1d_companion(q,companion,xi,value,derivative,companion_value,ok)
-        real(KREAL),intent(in)::q(5),companion(5),xi
-        real(KREAL),intent(out)::value,derivative,companion_value
-        logical,intent(out)::ok
-        real(KREAL)::fw(4),coef(0:4,4),ccoef(0:4,4),pow(0:4),dpow(0:4)
-        real(KREAL)::cand(4),dcand(4),ccand(4)
-        integer::c,d,k
-        call weno_coefficients(q,fw,coef,ok);if(.not.ok)return
-        ccoef=0.0_KREAL
-        do c=1,3;do k=c,c+2;do d=0,2
-            ccoef(d,c)=ccoef(d,c)+cmap(d,k,c)*companion(k)
-        enddo;enddo;enddo
-        do k=1,5;do d=0,4
-            ccoef(d,4)=ccoef(d,4)+cmap(d,k,4)*companion(k)
-        enddo;enddo
-        pow(0)=1.0_KREAL;dpow(0)=0.0_KREAL
-        do d=1,4;pow(d)=pow(d-1)*xi;dpow(d)=real(d,KREAL)*xi**(d-1);enddo
-        do c=1,4
-            cand(c)=sum(coef(:,c)*pow);dcand(c)=sum(coef(:,c)*dpow)
-            ccand(c)=sum(ccoef(:,c)*pow)
-        enddo
-        value=sum(fw*cand);derivative=sum(fw*dcand);companion_value=sum(fw*ccand)
-        ok=all(ieee_is_finite([value,derivative,companion_value]))
-    end subroutine s2d1_weno1d_companion
 
     ! The prepared object is local to one five-cell template and one field.
     ! In particular, no nonlinear weights are shared between distinct

@@ -177,17 +177,6 @@ contains
         ok=residual<=gate.and.all(ieee_is_finite(dh)).and.all(ieee_is_finite(db))
     end subroutine m_direction_prepared
 
-    subroutine target_at(w,q,u,v,weight,sh,sb,ok)
-        real(KREAL),intent(in)::w(4),q(2),u(:),v(:),weight(:)
-        real(KREAL),intent(out)::sh(:),sb(:)
-        logical,intent(out)::ok
-        real(KREAL)::mh(size(u)),mb(size(u)),kxh(size(u)),kxb(size(u))
-        real(KREAL)::kyh(size(u)),kyb(size(u)),eah(size(u)),eab(size(u)),kap(2,2),res
-        call make_mke(w,u,v,weight,mh,mb,kxh,kxb,kyh,kyb,eah,eab,kap,ok,res)
-        if(ok)then
-            sh=mh+kxh*q(1)+kyh*q(2);sb=mb+kxb*q(1)+kyb*q(2)
-        endif
-    end subroutine target_at
 
     ! v2.0 full-Van-Leer comparator: analytic Maxwellian and the original,
     ! unprojected Shakhov correction.  This deliberately does not use the

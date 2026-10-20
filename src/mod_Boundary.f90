@@ -225,57 +225,6 @@ contains
     
 
     !-------------------------------------------------------------------
-    subroutine bc_periodic(dirc)        !only applied to single block instead of parallel simulation
-        integer,intent(in) :: dirc
-        integer(KINT) :: i,j,k !Cell loop indices and flattened velocity-space index
-
-        select case(dirc)
-            case(Idirc)
-                do j=1,ny
-                    do i=1,ghost
-                        ctr(1-i,j)%conVars = ctr(nx-i+1,j)%conVars
-                        !Copy periodic VDFs through flattened ghost-cell views.
-                        do k=1,Nvel
-                            ctr(1-i,j)%h_vec(k) = ctr(nx-i+1,j)%h_vec(k)
-                            ctr(1-i,j)%b_vec(k) = ctr(nx-i+1,j)%b_vec(k)
-                        enddo
-                        ctr(1-i,j)%sh_vec = ctr(nx-i+1,j)%sh_vec
-                        ctr(1-i,j)%sb_vec = ctr(nx-i+1,j)%sb_vec
-
-                        ctr(nx+i,j)%conVars = ctr(1+i-1,j)%conVars
-                        !Copy periodic VDFs through flattened ghost-cell views.
-                        do k=1,Nvel
-                            ctr(nx+i,j)%h_vec(k) = ctr(1+i-1,j)%h_vec(k)
-                            ctr(nx+i,j)%b_vec(k) = ctr(1+i-1,j)%b_vec(k)
-                        enddo
-                        ctr(nx+i,j)%sh_vec = ctr(1+i-1,j)%sh_vec
-                        ctr(nx+i,j)%sb_vec = ctr(1+i-1,j)%sb_vec
-                    enddo
-                end do
-            case(Jdirc)
-                do i=1,nx
-                    do j=1,ghost
-                        ctr(i,1-j)%conVars = ctr(i,ny-j+1)%conVars
-                        !Copy periodic VDFs through flattened ghost-cell views.
-                        do k=1,Nvel
-                            ctr(i,1-j)%h_vec(k) = ctr(i,ny-j+1)%h_vec(k)
-                            ctr(i,1-j)%b_vec(k) = ctr(i,ny-j+1)%b_vec(k)
-                        enddo
-                        ctr(i,1-j)%sh_vec = ctr(i,ny-j+1)%sh_vec
-                        ctr(i,1-j)%sb_vec = ctr(i,ny-j+1)%sb_vec
-
-                        ctr(i,ny+j)%conVars = ctr(i,1+j-1)%conVars
-                        !Copy periodic VDFs through flattened ghost-cell views.
-                        do k=1,Nvel
-                            ctr(i,ny+j)%h_vec(k) = ctr(i,1+j-1)%h_vec(k)
-                            ctr(i,ny+j)%b_vec(k) = ctr(i,1+j-1)%b_vec(k)
-                        enddo
-                        ctr(i,ny+j)%sh_vec = ctr(i,1+j-1)%sh_vec
-                        ctr(i,ny+j)%sb_vec = ctr(i,1+j-1)%sb_vec
-                    enddo
-                end do
-        end select
-    end subroutine bc_periodic
     
     
     !-------------------------------------------------------------------

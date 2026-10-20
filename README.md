@@ -1,3 +1,5 @@
+> 本目录为 **v1.1a**，基于 v1.1 / b8eb22b 的保守精简版。删除范围、逐字节检查与短步对照见 [CLEANUP_CN.md](CLEANUP_CN.md)。下文为原发布说明；原发布身份与验证清单保存在 `provenance/cleanup_origin/`。
+
 # UGKS2D high order — 二维 Couette 高阶隐式阶段版本
 
 **已成功实现高阶隐式二维 Couette 计算，主要流场与同工况二阶隐式、二阶显式结果接近。**

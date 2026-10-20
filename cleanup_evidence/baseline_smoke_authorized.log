@@ -1,0 +1,4 @@
+high_implicit {'exit_code': 0, 'wall_seconds': 2.905770542, 'stderr': ''}
+low_implicit {'exit_code': 0, 'wall_seconds': 0.6733069999999999, 'stderr': ''}
+low_explicit {'exit_code': 0, 'wall_seconds': 0.41988512499999997, 'stderr': ''}
+/Users/sherlmes/codes/UGKS/codes/UGKS1D_high_order_validation/research/ugks2d_cleanup_20261020T082315Z/baseline/runs/release_smoke_20261020T162446

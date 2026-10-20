@@ -1,0 +1,41 @@
+{
+  "build": "GNU MPI clean build PASS",
+  "source_config_byte_identity": true,
+  "source_config_count": 56,
+  "shell_syntax": "PASS",
+  "smoke_tests": {
+    "high_implicit": {
+      "exit_code": 0,
+      "wall_seconds": 3.0903535,
+      "stderr": "",
+      "completed_steps": 2,
+      "stop": "expected_two_step_limit",
+      "steady_convergence_claim": false,
+      "max_moment": 4.372466387407694e-15,
+      "max_mass_error": 2.220446049250313e-16
+    },
+    "low_implicit": {
+      "exit_code": 0,
+      "wall_seconds": 0.6032368750000003,
+      "stderr": "",
+      "completed_steps": 2,
+      "stop": "expected_two_step_limit",
+      "steady_convergence_claim": false,
+      "max_moment": 3.9352846180307e-15,
+      "max_mass_error": 5.551115123125783e-16
+    },
+    "low_explicit": {
+      "exit_code": 0,
+      "wall_seconds": 0.409156834,
+      "stderr": "",
+      "completed_steps": 2,
+      "stop": "expected_two_step_limit",
+      "steady_convergence_claim": false
+    }
+  },
+  "launcher_sandbox_failure": "First launch could not bind a local MPI socket; solver did not start. Subsequent authorized MPI launch completed.",
+  "new_scientific_validation": false,
+  "full_trajectories_rerun": false,
+  "intel_rebuilt_this_release": false,
+  "note": "Historical evidence JSON files retain original scope; this file records only 2026-10-20 release checks."
+}

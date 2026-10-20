@@ -867,94 +867,9 @@ contains
     !>The following subroutines are more general, but only support sendrecv one variables at one time
     !------------------------------------------------------------------------------------------------
     !Send and recv mesg: updata overlaped macro-variables in x direction (one variables at one time)
-    subroutine MPIUpdata_MacroVars_Xdirc(f)
-        implicit none
-        real(KREAL),intent(inout)   :: f(1-LAP:nx+LAP,1-LAP:ny+LAP)
-        integer                     :: i,j,k1
-        real(KREAL)                 :: tmp_send1(LAP*ny),tmp_send2(LAP*ny),tmp_recv1(LAP*ny),tmp_recv2(LAP*ny)
-
-        do j=1,ny
-            do i=1,LAP
-                k1=(j-1)*LAP+i
-                tmp_send1(k1)=f(i,j)
-                tmp_send2(k1)=f(nx-LAP+i,j)
-            enddo
-        enddo
-
-        communication_clock=MPI_Wtime()
-        call MPI_Sendrecv(tmp_send1, LAP*ny, MPI_KREAL, ID_X_minus, 9000, &
-                          tmp_recv2, LAP*ny, MPI_KREAL, ID_X_plus,  9000, MPI_COMM_WORLD, Status, ierr)
-        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
-        communication_clock=MPI_Wtime()
-        call MPI_Sendrecv(tmp_send2, LAP*ny, MPI_KREAL, ID_X_plus,  8000,   &
-                          tmp_recv1, LAP*ny, MPI_KREAL, ID_X_minus, 8000, MPI_COMM_WORLD, Status, ierr)
-        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
-
-        if(ID_X_minus .ne. MPI_PROC_NULL) then
-            do j=1,ny
-                do i=1,LAP
-                    k1=(j-1)*LAP+i
-                    f(i-LAP,j)=tmp_recv1(k1)
-                enddo
-            enddo
-        endif
-
-        if(ID_X_plus .ne. MPI_PROC_NULL) then
-            do j=1,ny
-                do i=1,LAP
-                    k1=(j-1)*LAP+i
-                    f(nx+i,j)=tmp_recv2(k1)
-                enddo
-            enddo
-        endif
-
-    end subroutine MPIUpdata_MacroVars_Xdirc
 
     
     !Send and recv mesg: updata overlaped macro-variables in y direction (one variables at one time)
-    subroutine MPIUpdata_MacroVars_Ydirc(f)
-        implicit none
-        real(KREAL),intent(inout)   :: f(1-LAP:nx+LAP,1-LAP:ny+LAP)
-        integer                     :: i,j,k1
-        real(KREAL)                 :: tmp_send1(LAP*nx),tmp_send2(LAP*nx),tmp_recv1(LAP*nx),tmp_recv2(LAP*nx)
-
-        do j=1,LAP
-            do i=1,nx
-                k1=(j-1)*nx+i
-                tmp_send1(k1)=f(i,j)
-                tmp_send2(k1)=f(i,ny+j-LAP)
-            enddo
-        enddo
-
-        communication_clock=MPI_Wtime()
-        call MPI_Sendrecv(tmp_send1, LAP*nx, MPI_KREAL, ID_Y_minus, 9000, &
-                          tmp_recv2, LAP*nx, MPI_KREAL, ID_Y_plus,  9000, MPI_COMM_WORLD, Status, ierr)
-        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
-        communication_clock=MPI_Wtime()
-        call MPI_Sendrecv(tmp_send2, LAP*nx, MPI_KREAL, ID_Y_plus,  8000,   &
-                          tmp_recv1, LAP*nx, MPI_KREAL, ID_Y_minus, 8000, MPI_COMM_WORLD, Status, ierr)
-        communication_seconds=communication_seconds+MPI_Wtime()-communication_clock
-
-
-        if(ID_Y_minus .ne. MPI_PROC_NULL) then
-            do j=1,LAP
-                do i=1,nx
-                    k1=(j-1)*nx+i
-                    f(i,j-LAP)=tmp_recv1(k1)
-                enddo
-            enddo
-        endif
-
-        if(ID_Y_plus .ne. MPI_PROC_NULL) then
-            do j=1,LAP
-                do i=1,nx
-                    k1=(j-1)*nx+i
-                    f(i,ny+j)=tmp_recv2(k1)
-                enddo
-            enddo
-        endif
-
-    end subroutine MPIUpdata_MacroVars_Ydirc
 
     !Exchange one face-neighbour halo layer for a packed correction field.
     subroutine MPIExchangeField3D(field,ncomp,tag_base)

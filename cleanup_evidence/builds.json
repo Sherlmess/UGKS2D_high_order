@@ -1,0 +1,16 @@
+{
+  "status": "PASS_BOTH_CLEAN_BUILDS",
+  "versions": {
+    "mpifort": "GNU Fortran (Homebrew GCC 15.2.0) 15.2.0",
+    "mpirun": "mpirun (Open MPI) 5.0.8",
+    "make": "GNU Make 3.81"
+  },
+  "commands": {
+    "baseline": "bash build.sh",
+    "simplified": "bash build.sh"
+  },
+  "binary_sha256": {
+    "baseline": "28052c517196069a3e7d04cc493cd0b25f9f2820239a069dc2ab826e2e3a4463",
+    "simplified": "5ea7546f37bb531fde97e18253ed4d0f191bbd989fc5a882fa75b5782a8dd5f6"
+  }
+}

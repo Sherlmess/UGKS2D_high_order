@@ -70,10 +70,7 @@ $(OBJ_DIR)/mod_Tools.o: $(OBJ_DIR)/mod_Globaldata.o
 $(OBJ_DIR)/mod_ImportPara.o: $(OBJ_DIR)/mod_Globaldata.o $(OBJ_DIR)/mod_Tools.o
 $(OBJ_DIR)/mod_Interpolation.o: $(OBJ_DIR)/mod_Globaldata.o $(OBJ_DIR)/mod_Tools.o
 $(OBJ_DIR)/mod_Evolution.o: $(OBJ_DIR)/mod_Interpolation.o $(OBJ_DIR)/mod_Tools.o $(OBJ_DIR)/mod_Globaldata.o
-$(OBJ_DIR)/mod_WENO5AOScalar.o: $(OBJ_DIR)/mod_Globaldata.o
-$(OBJ_DIR)/mod_WENO5AO2D.o: $(OBJ_DIR)/mod_WENO5AOScalar.o $(OBJ_DIR)/mod_Globaldata.o
-$(OBJ_DIR)/mod_CorrectedWF2DTypes.o: $(OBJ_DIR)/mod_Globaldata.o
-$(OBJ_DIR)/mod_CorrectedWF2DEquilibrium.o: $(OBJ_DIR)/mod_CorrectedWF2DTypes.o $(OBJ_DIR)/mod_WENO5AO2D.o $(OBJ_DIR)/mod_Globaldata.o
+$(OBJ_DIR)/mod_CorrectedWF2DEquilibrium.o: $(OBJ_DIR)/mod_Globaldata.o
 $(OBJ_DIR)/mod_CorrectedWF2DClosure.o: $(OBJ_DIR)/mod_CorrectedWF2DEquilibrium.o $(OBJ_DIR)/mod_Globaldata.o
 $(OBJ_DIR)/mod_S2D1Reconstruction.o: $(OBJ_DIR)/mod_Globaldata.o
 $(OBJ_DIR)/mod_S2D1.o: $(OBJ_DIR)/mod_S2D1Reconstruction.o $(OBJ_DIR)/mod_CorrectedWF2DClosure.o $(OBJ_DIR)/mod_CorrectedWF2DEquilibrium.o $(OBJ_DIR)/mod_Globaldata.o

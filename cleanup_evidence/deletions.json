@@ -1,0 +1,278 @@
+{
+  "origin_commit": "b8eb22b487fc6b4c42633f049dec089b4c7082c7",
+  "removed_procedures": [
+    {
+      "file": "mod_CorrectedWF2DEquilibrium.f90",
+      "procedure": "constant_bgk_cell_average_target_2d",
+      "deleted_body_lines": 56
+    },
+    {
+      "file": "mod_CorrectedWF2DEquilibrium.f90",
+      "procedure": "constant_bgk_cell_average_target_direction_2d",
+      "deleted_body_lines": 68
+    },
+    {
+      "file": "mod_CorrectedWF2DEquilibrium.f90",
+      "procedure": "constant_bgk_point_target_value",
+      "deleted_body_lines": 17
+    },
+    {
+      "file": "mod_CorrectedWF2DEquilibrium.f90",
+      "procedure": "constant_bgk_point_target_direction",
+      "deleted_body_lines": 23
+    },
+    {
+      "file": "mod_CorrectedWF2DClosure.f90",
+      "procedure": "projector_direction_2d",
+      "deleted_body_lines": 33
+    },
+    {
+      "file": "mod_CorrectedWF2DClosure.f90",
+      "procedure": "stationary_e_2d",
+      "deleted_body_lines": 33
+    },
+    {
+      "file": "mod_CorrectedWF2DClosure.f90",
+      "procedure": "stationary_e_direction_2d",
+      "deleted_body_lines": 48
+    },
+    {
+      "file": "mod_CorrectedWF2DClosure.f90",
+      "procedure": "dq_value_and_direction",
+      "deleted_body_lines": 65
+    },
+    {
+      "file": "mod_CorrectedWF2DClosure.f90",
+      "procedure": "solve_q_and_derivatives",
+      "deleted_body_lines": 70
+    },
+    {
+      "file": "mod_CorrectedWF2DClosure.f90",
+      "procedure": "q_state_and_derivatives",
+      "deleted_body_lines": 54
+    },
+    {
+      "file": "mod_S2D1.f90",
+      "procedure": "target_at",
+      "deleted_body_lines": 11
+    },
+    {
+      "file": "mod_S2D1Reconstruction.f90",
+      "procedure": "s2d1_weno1d_companion",
+      "deleted_body_lines": 24
+    },
+    {
+      "file": "mod_Output.f90",
+      "procedure": "write_microVDF",
+      "deleted_body_lines": 124
+    },
+    {
+      "file": "mod_Boundary.f90",
+      "procedure": "bc_periodic",
+      "deleted_body_lines": 51
+    },
+    {
+      "file": "mod_MPI.f90",
+      "procedure": "MPIUpdata_MacroVars_Xdirc",
+      "deleted_body_lines": 42
+    },
+    {
+      "file": "mod_MPI.f90",
+      "procedure": "MPIUpdata_MacroVars_Ydirc",
+      "deleted_body_lines": 43
+    }
+  ],
+  "removed_modules": [
+    "mod_CorrectedWF2DTypes.f90",
+    "mod_WENO5AO2D.f90",
+    "mod_WENO5AOScalar.f90"
+  ],
+  "files": {
+    "main_UGKS2D.f90": {
+      "before": "8ce0c33fa972d945b4524274720d672ceb6f99d707e59cd070dfaa057be20c78",
+      "after": "8ce0c33fa972d945b4524274720d672ceb6f99d707e59cd070dfaa057be20c78"
+    },
+    "mod_Boundary.f90": {
+      "before": "e3da6c257c3b11f6d31c684c6ca37756d1603af34728019d36aa1b060af76a04",
+      "after": "4ad77dd73fa4550b86e35033b167fa081df0926502406d8c7d445948f3115ad1"
+    },
+    "mod_ClosedCouetteMass.f90": {
+      "before": "6d5eff41b9c2a613018edaf84dfe5446e2261cfc4cc8637705404bd2c0bb3919",
+      "after": "6d5eff41b9c2a613018edaf84dfe5446e2261cfc4cc8637705404bd2c0bb3919"
+    },
+    "mod_CorrectedWF2DClosure.f90": {
+      "before": "4cb9f4595045a3c780794f2c1f6d4bee724f7597ce2eb23454ea10f2a7579957",
+      "after": "f98e723a4dad7ee63598a847d856dfaf08a3e6cac6e592670be442af848333f7"
+    },
+    "mod_CorrectedWF2DEquilibrium.f90": {
+      "before": "4b4b01673991b33858e84dc7d8de6adda9ba1460464fb544859f3837116404cd",
+      "after": "dec11a6d711a7dc658e906367652a7d782dde8c601a33ebc1a28d0111fd5f633"
+    },
+    "mod_CorrectedWF2DTypes.f90": {
+      "before": "4b236aa307c5cf26c66521aa5c69c0a4b308f7c06cd5b939c38acc2443fe50b9",
+      "after": null
+    },
+    "mod_Evolution.f90": {
+      "before": "9cd257e45a31c68e84e52d5a826f28c4b5e7e2b6e4aecab08b46896afe1109b9",
+      "after": "9cd257e45a31c68e84e52d5a826f28c4b5e7e2b6e4aecab08b46896afe1109b9"
+    },
+    "mod_Globaldata.f90": {
+      "before": "22e405f25cf78297b2ab5060fef697a07cd8a34a512f43a1aa26d154aaf2524e",
+      "after": "22e405f25cf78297b2ab5060fef697a07cd8a34a512f43a1aa26d154aaf2524e"
+    },
+    "mod_ImplicitBoundary.f90": {
+      "before": "333536d9bd558ad3cec6a8ae5ce6ad7967af891f414c92fd8f414c970a94a568",
+      "after": "333536d9bd558ad3cec6a8ae5ce6ad7967af891f414c92fd8f414c970a94a568"
+    },
+    "mod_ImplicitCommon.f90": {
+      "before": "24e6ad855c420235b345d3e231f47016f5983110e6a8be3d3b8811523bb471ee",
+      "after": "24e6ad855c420235b345d3e231f47016f5983110e6a8be3d3b8811523bb471ee"
+    },
+    "mod_ImplicitDiagnostics.f90": {
+      "before": "4c747ea4ea68caa5bb8046f7e1eafdd45c386473af437c3d08f131ef83571fb9",
+      "after": "4c747ea4ea68caa5bb8046f7e1eafdd45c386473af437c3d08f131ef83571fb9"
+    },
+    "mod_ImplicitMacro.f90": {
+      "before": "506cb0c5ee94a4727fafb651a982b9ba9c286ddb9534017d79bb9781ad1dbfb9",
+      "after": "506cb0c5ee94a4727fafb651a982b9ba9c286ddb9534017d79bb9781ad1dbfb9"
+    },
+    "mod_ImplicitMicro.f90": {
+      "before": "7348d5df23acbb43ee3984bf1f901ba164be02cde5fa4c9c08ca1896236a51d2",
+      "after": "7348d5df23acbb43ee3984bf1f901ba164be02cde5fa4c9c08ca1896236a51d2"
+    },
+    "mod_ImplicitState.f90": {
+      "before": "a5cf15d386f50d539c499d2dba042196a15f92498a3eabe1deb5e316ece2f401",
+      "after": "a5cf15d386f50d539c499d2dba042196a15f92498a3eabe1deb5e316ece2f401"
+    },
+    "mod_ImportPara.f90": {
+      "before": "e116ab5a52bb0f2a9a2b9632bc5c5889bfee84ce1778d111c8b4202003c2aa34",
+      "after": "e116ab5a52bb0f2a9a2b9632bc5c5889bfee84ce1778d111c8b4202003c2aa34"
+    },
+    "mod_InitializeFlow.f90": {
+      "before": "0b7a4dd3b192e1ab0cf58ed82aa2c45a982998e9029fe929d26935048baad1fc",
+      "after": "0b7a4dd3b192e1ab0cf58ed82aa2c45a982998e9029fe929d26935048baad1fc"
+    },
+    "mod_Interpolation.f90": {
+      "before": "6c47be4c9c7e7834e1fe491ca32bee038033ba5bc5588c13d4ee1364cf3ca755",
+      "after": "6c47be4c9c7e7834e1fe491ca32bee038033ba5bc5588c13d4ee1364cf3ca755"
+    },
+    "mod_MPI.f90": {
+      "before": "8fd0ba5c9b2312a10fd318de37faf8971992b6e1a99277398ad6876b5fe8d02f",
+      "after": "81a5720963df1637e43e1460ed1af2cb12402f781df986fa9cf5d77432234caf"
+    },
+    "mod_NativeWiringChecks.f90": {
+      "before": "e0c11ea0f6d9e1c1cbcc652def1d8541e571b4aea91e5a4698ae506ec3324076",
+      "after": "e0c11ea0f6d9e1c1cbcc652def1d8541e571b4aea91e5a4698ae506ec3324076"
+    },
+    "mod_Output.f90": {
+      "before": "cf8f405ef2db79898ba1be36a45ff2daa205b3075da03275b3cd8e4ae5b7b20c",
+      "after": "f02b2734bf836fc3b2fb214b4a71ecb8a5f7b1daf892b65fc59f5825bb9812d5"
+    },
+    "mod_R5Observe.f90": {
+      "before": "dcd55aa0926e0fc2610f96b53377664fd524fd30aa0cd6bef379e0a2f52e540a",
+      "after": "dcd55aa0926e0fc2610f96b53377664fd524fd30aa0cd6bef379e0a2f52e540a"
+    },
+    "mod_Residual.f90": {
+      "before": "4c7a5794b0f2097d0abdceb2aab46f609cad73db0f44a3f293e480cf3bf22fc0",
+      "after": "4c7a5794b0f2097d0abdceb2aab46f609cad73db0f44a3f293e480cf3bf22fc0"
+    },
+    "mod_S2CartesianMPI.f90": {
+      "before": "2da96a04551f8735b778dae5043ab38bad20bd2c94a2508aec4fbcf4a9ccd806",
+      "after": "2da96a04551f8735b778dae5043ab38bad20bd2c94a2508aec4fbcf4a9ccd806"
+    },
+    "mod_S2D1.f90": {
+      "before": "216ad87ce56c0c7fe8f51617a955d68d653c22a72f728a2527c66171d4681bdc",
+      "after": "50aafe0651baebfbf1483103f3252d99fa529d363d3a9375b6e1e71227c23196"
+    },
+    "mod_S2D1Reconstruction.f90": {
+      "before": "781cc0839839c1b3dcf677b1bccdd32aef0d6790d402fcb7373d1cee7cf29d52",
+      "after": "7a793c304919dcaacc8aa68f822633a138628318d0cedfe214f7b55d84c2d270"
+    },
+    "mod_S2MPI1.f90": {
+      "before": "815d3a56160276c4667ab7706963c80dbc936aade2d8e8d10b6696585d6f498b",
+      "after": "815d3a56160276c4667ab7706963c80dbc936aade2d8e8d10b6696585d6f498b"
+    },
+    "mod_S2MPI1Layout.f90": {
+      "before": "cbd5d03f960c8164f5097e82b76f305b74a98c6e98a7f239ee412406e462806f",
+      "after": "cbd5d03f960c8164f5097e82b76f305b74a98c6e98a7f239ee412406e462806f"
+    },
+    "mod_S2MPI2IO.f90": {
+      "before": "c0c97115932797e6cf1d69174854da4b73912dcb82cb28473219b3204c68530c",
+      "after": "c0c97115932797e6cf1d69174854da4b73912dcb82cb28473219b3204c68530c"
+    },
+    "mod_S2MultiscaleWall.f90": {
+      "before": "b5f0b64f9499b1a4d57d6e59a51028c49f24d693c1ec07db8eceb374d820460f",
+      "after": "b5f0b64f9499b1a4d57d6e59a51028c49f24d693c1ec07db8eceb374d820460f"
+    },
+    "mod_S2MultiscaleWallLegacy.f90": {
+      "before": "a41ed1fc37a3a0bfcb334907122c41b194a1dfa1f718501af6677c8df7d1ee0e",
+      "after": "a41ed1fc37a3a0bfcb334907122c41b194a1dfa1f718501af6677c8df7d1ee0e"
+    },
+    "mod_S2NativeAdapter.f90": {
+      "before": "bd1a6e5209e8e71846ecd1a5debf5e5f31fad88d6e7d19ffed6f43e92d6c1696",
+      "after": "bd1a6e5209e8e71846ecd1a5debf5e5f31fad88d6e7d19ffed6f43e92d6c1696"
+    },
+    "mod_S2NativeRestart.f90": {
+      "before": "cfd9e9228137edcae2c78f3f33aa521417778f402d836b5d6d1d652c2a8c6b50",
+      "after": "cfd9e9228137edcae2c78f3f33aa521417778f402d836b5d6d1d652c2a8c6b50"
+    },
+    "mod_S2PhysicalGas.f90": {
+      "before": "972d81957b45552397541140fc62623cd68b4d186aab5a6c610c925ccad66e66",
+      "after": "972d81957b45552397541140fc62623cd68b4d186aab5a6c610c925ccad66e66"
+    },
+    "mod_S2StateConventions.f90": {
+      "before": "a67d0ed56b11b3d82676afab7324c5297edac5f1005e226cf0c1d06babda6599",
+      "after": "a67d0ed56b11b3d82676afab7324c5297edac5f1005e226cf0c1d06babda6599"
+    },
+    "mod_S2SteadyIteration.f90": {
+      "before": "bd7f8ca71ee963d22f3761a168d90cd18069b2e9f17b77202195699480ddae0f",
+      "after": "bd7f8ca71ee963d22f3761a168d90cd18069b2e9f17b77202195699480ddae0f"
+    },
+    "mod_S2SteadyTermination.f90": {
+      "before": "9caeaff45420315c8e6593152bddf22b4edf9e2d8c161862f31e6e244ce54767",
+      "after": "9caeaff45420315c8e6593152bddf22b4edf9e2d8c161862f31e6e244ce54767"
+    },
+    "mod_Solve.f90": {
+      "before": "5b6f6d4a48223f3320ae838a1a14fd32097c6eb763d6d698e65f97e37b2ad80e",
+      "after": "5b6f6d4a48223f3320ae838a1a14fd32097c6eb763d6d698e65f97e37b2ad80e"
+    },
+    "mod_SteadyImplicit.f90": {
+      "before": "4a119b78d613e027c86140018ef92dd4c739c2bc23073b56c5661421c44ea331",
+      "after": "4a119b78d613e027c86140018ef92dd4c739c2bc23073b56c5661421c44ea331"
+    },
+    "mod_TimeIntegrator.f90": {
+      "before": "dc10dc864604345960c3e0b0aed38fdf3e971d7543c496b7bda131f8b76042ae",
+      "after": "dc10dc864604345960c3e0b0aed38fdf3e971d7543c496b7bda131f8b76042ae"
+    },
+    "mod_Tools.f90": {
+      "before": "df645cc0b9be52030453978d0bd59a4d48ec8a047a2a883d0807313d324d4622",
+      "after": "df645cc0b9be52030453978d0bd59a4d48ec8a047a2a883d0807313d324d4622"
+    },
+    "mod_UnsteadyImplicit.f90": {
+      "before": "648d29fa3a008c704f78d90bff4e0ad36c2e94aee3547b6b67af7e1161852515",
+      "after": "648d29fa3a008c704f78d90bff4e0ad36c2e94aee3547b6b67af7e1161852515"
+    },
+    "mod_VelocityTables.f90": {
+      "before": "ab8c04e60a016a320ab2b873b3a2e6d6ad5a386b767f756b99057eca8da5b34b",
+      "after": "ab8c04e60a016a320ab2b873b3a2e6d6ad5a386b767f756b99057eca8da5b34b"
+    },
+    "mod_W3BObserver.f90": {
+      "before": "12d6ac7d65534b87fe76d5af6f722a98ea81377c3b4715fe3cc9abf6c7b30428",
+      "after": "12d6ac7d65534b87fe76d5af6f722a98ea81377c3b4715fe3cc9abf6c7b30428"
+    },
+    "mod_WENO5AO2D.f90": {
+      "before": "2da0d2e407b27099d1835a0deba7a51b11cc213d7e2409492c32b34629a291fc",
+      "after": null
+    },
+    "mod_WENO5AOScalar.f90": {
+      "before": "88982ef879b54352da186536be6b3fce81d5ced02fbf0206c9841bee3b5b617b",
+      "after": null
+    },
+    "mpi2_platform.c": {
+      "before": "ab5ee0a78e2fbe02e2a315b9094442d3b41c25beef3842b0d389ce91b4731712",
+      "after": "ab5ee0a78e2fbe02e2a315b9094442d3b41c25beef3842b0d389ce91b4731712"
+    }
+  },
+  "source_lines_before": 22940,
+  "source_lines_after": 21575
+}
