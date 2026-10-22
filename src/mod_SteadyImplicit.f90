@@ -4,8 +4,8 @@ module mod_SteadyImplicit
     use mod_ImplicitState
     use mod_ImplicitCommon, only: MomentConserved, IsPhysicalState
     use mod_ImplicitBoundary, only: BuildStructuredMirrorMaps, ValidateImplicitSymmetryFaces
-    use mod_ImplicitMacro, only: SolveMacroPR2, BuildPredictedMacroState
-    use mod_ImplicitMicro, only: BuildPredictedEquilibrium, SolveMicroLUSGS, RecoverMacroFromKineticState, &
+    use mod_ImplicitMacro, only: SolveMacroPR2, BuildPredictedMacroState, DumpCornerMacroDefect
+    use mod_ImplicitMicro, only: BuildPredictedEquilibrium, SolveMicroLUSGS, RecoverMacroFromKineticState, DumpCornerMicroDefect, &
         EnforceStreamingMomentCompatibility, EnforceAcceptedMomentCompatibility, &
         EnforceFreestreamGhostMomentCompatibility, EvaluateMicroPointBreakdown, &
         EvaluatePredictedEquilibriumBreakdown, WeightedNegativeFractionCore=>WeightedNegativeFraction
@@ -430,6 +430,17 @@ contains
                 start_stage=MPI_Wtime(); call SolveMicroLUSGS(ok,freeze_wall_closure=.true.)
                 implicit_lusgs_seconds=implicit_lusgs_seconds+MPI_Wtime()-start_stage
             endif
+            if(ok)then
+                block
+                    character(len=8)::diagnostic_flag
+                    integer::diagnostic_status
+                    call get_environment_variable('CORNER_IMPLICIT_DIAG',diagnostic_flag,status=diagnostic_status)
+                    if(diagnostic_status==0.and.trim(diagnostic_flag)=='1')then
+                        call DumpCornerMacroDefect()
+                        call DumpCornerMicroDefect()
+                    endif
+                end block
+            endif
             if (ok) call FindAdmissibleMicroAlpha(implicit_alpha,ok,.false.)
             if (ok) exit
             implicit_ncfl_active=0.5_KREAL*implicit_ncfl_active
@@ -444,6 +455,20 @@ contains
             ctr(i,j)%b_vec=ctr(i,j)%b_vec+implicit_alpha*delta_b(:,i,j)
         enddo; enddo
         call RecoverMacroFromKineticState(ok)
+        block
+            character(len=80)::flag,filename
+            integer::st,fu,ii,jj
+            call get_environment_variable('CORNER_IMPLICIT_DIAG',flag,status=st)
+            if(ok.and.st==0.and.trim(flag)=='1')then
+                write(filename,'(a,i0,a)')'raw_update_rank',myID,'.bin'
+                open(newunit=fu,file=trim(filename),status='new',access='stream',form='unformatted')
+                write(fu)nx,ny,Nvel,Block_XY(myID)%Origin_I,Block_XY(myID)%Origin_J
+                do jj=1,ny;do ii=1,nx
+                    write(fu)ctr(ii,jj)%conVars,ctr(ii,jj)%h_vec,ctr(ii,jj)%b_vec
+                enddo;enddo
+                close(fu)
+            endif
+        end block
         if (.not.ok) then
             implicit_total_seconds=implicit_total_seconds+MPI_Wtime()-start_total
             return

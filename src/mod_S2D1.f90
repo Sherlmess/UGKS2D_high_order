@@ -293,7 +293,7 @@ contains
         hm=hfield(i,j);bm=bfield(i,j);theta=1.0_KREAL;was_signed=.false.;ok=.false.
         if(present(cacheh).neqv.present(cacheb))return
         if(present(cacheh))then
-            if(S2W1_wall_mode==1)then
+            if(S2W1_wall_mode>=1)then
                 call s2d1_cell_faces9_cached(cacheh,i,j,hface,hnd,htd,hvol,lok,hfield,.true.);if(.not.lok)return
                 call s2d1_cell_faces9_cached(cacheb,i,j,bface,bnd,btd,bvol,lok,bfield,.true.);if(.not.lok)return
             else
@@ -301,7 +301,7 @@ contains
                 call s2d1_cell_faces9_cached(cacheb,i,j,bface,bnd,btd,bvol,lok);if(.not.lok)return
             endif
         else
-            if(S2W1_wall_mode==1)then
+            if(S2W1_wall_mode>=1)then
                 call s2d1_cell_faces9_wall(hfield,i,j,hface,hnd,htd,hvol,lok);if(.not.lok)return
                 call s2d1_cell_faces9_wall(bfield,i,j,bface,bnd,btd,bvol,lok);if(.not.lok)return
             else
@@ -714,13 +714,13 @@ contains
                 velocity_tiles:do k0=1,nvel,VT_VELOCITIES
                     nt=min(VT_VELOCITIES,nvel-k0+1)
                     if(profile_tile)call cpu_time(tile_t0)
-                    call prepare_velocity_tile(tile,h,b,k0,nt,[il,ih,jl,jh],S2W1_wall_mode==1,lok)
+                    call prepare_velocity_tile(tile,h,b,k0,nt,[il,ih,jl,jh],S2W1_wall_mode>=1,lok)
                     if(.not.lok)then;recon_ok=.false.;exit velocity_tiles;endif
                     if(profile_tile)then
                         call cpu_time(tile_t1);tile_prepare_s=tile_prepare_s+tile_t1-tile_t0
                     endif
                     do j=jl,jh;do i=il,ih
-                        call reconstruct_velocity_tile_cell(tile,h,b,k0,i,j,S2W1_wall_mode==1,lok)
+                        call reconstruct_velocity_tile_cell(tile,h,b,k0,i,j,S2W1_wall_mode>=1,lok)
                         if(.not.lok)then;recon_ok=.false.;exit velocity_tiles;endif
                         if(profile_tile)call cpu_time(tile_t0)
                         do kv=1,nt
@@ -747,15 +747,15 @@ contains
             else
             recon_vel: do k=1,nvel
                 if(use_scope)then
-                    call prepare_first_layer_plane(cacheh,h(:,:,k),lok,S2W1_wall_mode==1,[il,ih,jl,jh])
+                    call prepare_first_layer_plane(cacheh,h(:,:,k),lok,S2W1_wall_mode>=1,[il,ih,jl,jh])
                 else
-                    call prepare_first_layer_plane(cacheh,h(:,:,k),lok,S2W1_wall_mode==1)
+                    call prepare_first_layer_plane(cacheh,h(:,:,k),lok,S2W1_wall_mode>=1)
                 endif
                 if(.not.lok)then;recon_ok=.false.;exit recon_vel;endif
                 if(use_scope)then
-                    call prepare_first_layer_plane(cacheb,b(:,:,k),lok,S2W1_wall_mode==1,[il,ih,jl,jh])
+                    call prepare_first_layer_plane(cacheb,b(:,:,k),lok,S2W1_wall_mode>=1,[il,ih,jl,jh])
                 else
-                    call prepare_first_layer_plane(cacheb,b(:,:,k),lok,S2W1_wall_mode==1)
+                    call prepare_first_layer_plane(cacheb,b(:,:,k),lok,S2W1_wall_mode>=1)
                 endif
                 if(.not.lok)then;recon_ok=.false.;exit recon_vel;endif
             do j=jl,jh;do i=il,ih
@@ -799,9 +799,10 @@ contains
         call cpu_time(w2_start)
         do j=yrecon_lo(),active_hi(ny)
             do i=xrecon_lo(),xhi(nx)
+                if(.not.(cavity_mode().and.global_i(i)==global_nx(nx)))then
                 if(is_s2)then
                     do m=1,4
-                        call s2d1_face3(w(m,:,:),1,i,j,ml,mr,mnl,mnr,mtl,mtr,lok,S2W1_wall_mode==1)
+                        call s2d1_face3(w(m,:,:),1,i,j,ml,mr,mnl,mnr,mtl,mtr,lok,S2W1_wall_mode>=1)
                         if(.not.lok)then;ok=.false.;return;endif
                         macro_nl(m,:)=mnl/dx;macro_nr(m,:)=mnr/dx
                         macro_t(m,:)=0.5_KREAL*(mtl+mtr)/dy
@@ -844,10 +845,11 @@ contains
                         fxw(:,i,j)=fxw(:,i,j)+gw(a)*fw;face_error=max(face_error,err)
                     enddo
                 endif
-                if(S2W1_wall_mode==1.and.global_j(j)==global_ny(ny))cycle
+                endif ! interior x face (physical right wall is integrated below)
+                if(S2W1_wall_mode>=1.and.global_j(j)==global_ny(ny))cycle
                 if(is_s2)then
                     do m=1,4
-                        call s2d1_face3(w(m,:,:),2,j,i,ml,mr,mnl,mnr,mtl,mtr,lok,S2W1_wall_mode==1)
+                        call s2d1_face3(w(m,:,:),2,j,i,ml,mr,mnl,mnr,mtl,mtr,lok,S2W1_wall_mode>=1)
                         if(.not.lok)then;ok=.false.;return;endif
                         macro_nl(m,:)=mnl/dy;macro_nr(m,:)=mnr/dy
                         macro_t(m,:)=0.5_KREAL*(mtl+mtr)/dx
@@ -893,7 +895,32 @@ contains
             enddo
         enddo
         call cpu_time(w2_end);w2_closure_s=w2_end-w2_start
-        if(S2W1_wall_mode==1)then
+        if(cavity_mode())then
+            if(.not.cart_context.or.want_coeff)then;ok=.false.;return;endif
+            do j=active_lo(),active_hi(ny)
+                do a=1,3
+                    if(left_wall())then
+                        i=xlo()
+                        call s2w2_wall_node(-1,dt,dx,w([1,3,2,4],i,j),ch(1,a,:,i,j),cb(1,a,:,i,j), &
+                            chnd(1,a,:,i,j),cbnd(1,a,:,i,j),chtd(1,a,:,i,j),cbtd(1,a,:,i,j), &
+                            v,u,weight,0.0_KREAL,S2W1_wall_theta(1),fh,fb,fw,lok)
+                        if(.not.lok)then;ok=.false.;return;endif
+                        fxh(i-1,j,:)=fxh(i-1,j,:)+gw(a)*fh;fxb(i-1,j,:)=fxb(i-1,j,:)+gw(a)*fb
+                        fxw(:,i-1,j)=fxw(:,i-1,j)+gw(a)*fw([1,3,2,4])
+                    endif
+                    if(right_wall())then
+                        i=xhi(nx)
+                        call s2w2_wall_node(1,dt,dx,w([1,3,2,4],i,j),ch(2,a,:,i,j),cb(2,a,:,i,j), &
+                            chnd(2,a,:,i,j),cbnd(2,a,:,i,j),chtd(2,a,:,i,j),cbtd(2,a,:,i,j), &
+                            v,u,weight,0.0_KREAL,S2W1_wall_theta(1),fh,fb,fw,lok)
+                        if(.not.lok)then;ok=.false.;return;endif
+                        fxh(i,j,:)=fxh(i,j,:)+gw(a)*fh;fxb(i,j,:)=fxb(i,j,:)+gw(a)*fb
+                        fxw(:,i,j)=fxw(:,i,j)+gw(a)*fw([1,3,2,4])
+                    endif
+                enddo
+            enddo
+        endif
+        if(S2W1_wall_mode>=1)then
             if(.not.(present(lower_w).and.present(lower_h).and.present(lower_b)))then
                 ok=.false.;return
             endif
@@ -1271,7 +1298,7 @@ contains
                     target_error=max(target_error,err)
                 else
                     do m=1,4
-                        call s2d1_cell9(w(m,:,:),i,j,nodes(m,:,:),lok,S2W1_wall_mode==1)
+                        call s2d1_cell9(w(m,:,:),i,j,nodes(m,:,:),lok,S2W1_wall_mode>=1)
                         if(.not.lok)then;ok=.false.;return;endif
                     enddo
                     avg=0.0_KREAL

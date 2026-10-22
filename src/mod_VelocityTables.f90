@@ -14,13 +14,14 @@ contains
         if(st==1.or.len_trim(mode)==0)mode='full16'
         if(st/=0.and.st/=1)error stop 'invalid/truncated S2_VELOCITY_TABLE'
         select case(trim(mode))
-        case('full16','half16','half32')
-        case default;error stop 'S2_VELOCITY_TABLE must be full16/half16/half32'
+        case('full16','full28','half16','half32')
+        case default;error stop 'S2_VELOCITY_TABLE must be full16/full28/half16/half32'
         end select
     end function
     integer function VelocityCount()
         VelocityCount=16
         if(VelocityMode()=='half32')VelocityCount=32
+        if(VelocityMode()=='full28')VelocityCount=28
     end function
     real(KREAL) function VelocityMax()
         real(KREAL),allocatable::u(:),v(:),w(:),rn(:),rw(:)
@@ -39,6 +40,65 @@ contains
             error stop 'velocity table shape mismatch'
         select case(trim(VelocityMode()))
         case('full16');call FillFull16(u,v,weight,raw_node,raw_weight);return
+        case('full28')
+            raw_node=[ &
+                -6.59160544236774282e+00_KREAL, &
+                -5.85701464138285033e+00_KREAL, &
+                -5.24328537320293542e+00_KREAL, &
+                -4.69075652394311771e+00_KREAL, &
+                -4.17663674212926850e+00_KREAL, &
+                -3.68913423846167943e+00_KREAL, &
+                -3.22111207656145559e+00_KREAL, &
+                -2.76779535291359391e+00_KREAL, &
+                -2.32574984265644114e+00_KREAL, &
+                -1.89236049683768526e+00_KREAL, &
+                -1.46553726345740909e+00_KREAL, &
+                -1.04353527375420829e+00_KREAL, &
+                -6.24836719505209248e-01_KREAL, &
+                -2.08067382690736880e-01_KREAL, &
+                2.08067382690736880e-01_KREAL, &
+                6.24836719505209248e-01_KREAL, &
+                1.04353527375420829e+00_KREAL, &
+                1.46553726345740909e+00_KREAL, &
+                1.89236049683768526e+00_KREAL, &
+                2.32574984265644114e+00_KREAL, &
+                2.76779535291359391e+00_KREAL, &
+                3.22111207656145559e+00_KREAL, &
+                3.68913423846167943e+00_KREAL, &
+                4.17663674212926850e+00_KREAL, &
+                4.69075652394311771e+00_KREAL, &
+                5.24328537320293542e+00_KREAL, &
+                5.85701464138285033e+00_KREAL, &
+                6.59160544236774282e+00_KREAL]
+            raw_weight=[ &
+                1.14013934790366588e-19_KREAL, &
+                8.31593795120686525e-16_KREAL, &
+                6.63943671490967563e-13_KREAL, &
+                1.47585316827769321e-10_KREAL, &
+                1.32568250154170465e-08_KREAL, &
+                5.85771972099298245e-07_KREAL, &
+                1.43455042297143928e-05_KREAL, &
+                2.10618100024031899e-04_KREAL, &
+                1.95733129440898729e-03_KREAL, &
+                1.19684232143548192e-02_KREAL, &
+                4.95148892898981605e-02_KREAL, &
+                1.41394609786954811e-01_KREAL, &
+                2.82561391259388839e-01_KREAL, &
+                3.98604717826451238e-01_KREAL, &
+                3.98604717826451238e-01_KREAL, &
+                2.82561391259388839e-01_KREAL, &
+                1.41394609786954811e-01_KREAL, &
+                4.95148892898981605e-02_KREAL, &
+                1.19684232143548192e-02_KREAL, &
+                1.95733129440898729e-03_KREAL, &
+                2.10618100024031899e-04_KREAL, &
+                1.43455042297143928e-05_KREAL, &
+                5.85771972099298245e-07_KREAL, &
+                1.32568250154170465e-08_KREAL, &
+                1.47585316827769321e-10_KREAL, &
+                6.63943671490967563e-13_KREAL, &
+                8.31593795120686525e-16_KREAL, &
+                1.14013934790366588e-19_KREAL]
         case('half16')
             raw_node=[ &
                 -3.68600716272439710e+00_KREAL, -2.86313388370807509e+00_KREAL, &

@@ -133,3 +133,5 @@ $(OBJ_DIR)/mod_Output.o: $(OBJ_DIR)/mod_ImplicitDiagnostics.o
 
 # IO-R2 residual coefficient serialization.
 $(OBJ_DIR)/mod_Solve.o: $(OBJ_DIR)/mod_ClosedCouetteMass.o
+
+$(OBJ_DIR)/mod_S2D1Reconstruction.o: $(OBJ_DIR)/mod_Interpolation.o

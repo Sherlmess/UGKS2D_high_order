@@ -214,6 +214,9 @@ contains
         if(S2W1_wall_mode==1)then
             if(any(BC_Type(1:2)/=BCconst_periodic).or.any(BC_Type(3:4)/=BCconst_wall_isothermal)) &
                 call abort_native('S2W1 boundary mode mismatch',403)
+        elseif(S2W1_wall_mode==2)then
+            if(any(BC_Type/=BCconst_wall_isothermal))call abort_native('cavity requires four isothermal walls',403)
+            if(.not.cart_native)call abort_native('cavity requires native Cartesian adapter',403)
         else
             if(any(BC_Type/=BCconst_periodic))call abort_native('all four boundaries must be periodic',403)
         endif
@@ -224,7 +227,7 @@ contains
         tol=1.0e-14_KREAL
         if(.not.UnifiedPhysicalOperators.and.abs(dx-2.0_KREAL*pi_d/real(Nx_all,KREAL))>tol) &
             call abort_native('requires uniform x Cartesian mesh',406)
-        if(S2W1_wall_mode==1)then
+        if(S2W1_wall_mode>=1)then
             if(abs(dy-1.0_KREAL/real(Ny_all,KREAL))>tol) &
                 call abort_native('S2W1 requires uniform y in [0,1]',406)
         else
@@ -283,7 +286,7 @@ contains
                 case(4,5);rho=rho0
                 case default;call abort_native('native package supports initial modes 0 and 3 only',410)
                 end select
-                if(S2W1_wall_mode==1)then
+                if(S2W1_wall_mode>=1)then
                     x=0.0_KREAL
                     if(S2D1_initial_mode==5)x=0.1_KREAL*(y-0.5_KREAL)
                     cw(:,i,j)=[rho,rho*x,0.0_KREAL,rho*(0.5_KREAL*x*x+0.5_KREAL*real(ck+2,KREAL))]
@@ -405,7 +408,7 @@ contains
         write(steps_unit,'(A)')'step,time,face_moment,target_moment,cn_residual,macro_micro,limited,signed,'// &
             'dt_tau,cfl,h_min,h_max,b_min,b_max,global_drift,layout_s,face_s,map_s,collision_s,diagnostic_s'
         endif
-        if(S2W1_wall_mode==1)then
+        if(S2W1_wall_mode>=1)then
             allocate(lower_w(4,nx),lower_h(nx,Nvel),lower_b(nx,Nvel))
             if((S2Diagnostics.or..not.IsS2CN2()).and..not.cart_native)then
             open(newunit=wall_unit,file='wall_balance.csv',status='replace',action='write')
@@ -487,6 +490,7 @@ contains
         if(cart_native)then
             call CartesianEvolution(cw,ch,cb,fxw,fyw,fxh,fxb,fyh,fyb,lower_w,lower_h,lower_b,face_error,limited_count,signed_count,ok)
             evolution_calls=evolution_calls+1;evolution_ready=.true.
+            if(S2W1_wall_mode==2)call PublishWallDiagnostics()
             return
         endif
         if(S2W2R_shared_predictor==1)then
@@ -498,7 +502,7 @@ contains
             call compute_flux(cw,ch,cb,uVel,vVel,wVel,dx,dy,dt_global,fxw,fyw,fxh,fxb,fyh,fyb, &
                 face_error,limited_count,signed_count,ok,lower_w,lower_h,lower_b, &
                 leading_xh,leading_xb,leading_yh,leading_yb,time_xh,time_xb,time_yh,time_yb)
-        elseif(S2W1_wall_mode==1)then
+        elseif(S2W1_wall_mode>=1)then
             call compute_flux(cw,ch,cb,uVel,vVel,wVel,dx,dy,dt_global,fxw,fyw,fxh,fxb,fyh,fyb, &
                 face_error,limited_count,signed_count,ok,lower_w,lower_h,lower_b)
         else
@@ -570,7 +574,7 @@ contains
                 hface(i,j+1)%L_flux_b_vec=fyb(i,j,:)*hface(i,j+1)%length
                 hface(i,j+1)%R_flux_b_vec=hface(i,j+1)%L_flux_b_vec
             enddo
-            if(S2W1_wall_mode==1)then
+            if(S2W1_wall_mode>=1)then
                 hface(i,1)%L_flux=lower_w(:,i)*hface(i,1)%length
                 hface(i,ny+1)%L_flux=fyw(:,i,ny)*hface(i,ny+1)%length
                 hface(i,1)%L_flux_h_vec=lower_h(i,:)*hface(i,1)%length
@@ -584,7 +588,7 @@ contains
             hface(i,1)%R_flux_h_vec=hface(i,1)%L_flux_h_vec
             hface(i,ny+1)%L_flux_h_vec=fyh(i,ny,:)*hface(i,ny+1)%length
             hface(i,ny+1)%R_flux_h_vec=hface(i,ny+1)%L_flux_h_vec
-            if(S2W1_wall_mode==1)then
+            if(S2W1_wall_mode>=1)then
                 hface(i,1)%L_flux_b_vec=lower_b(i,:)*hface(i,1)%length
             else
                 hface(i,1)%L_flux_b_vec=fyb(i,ny,:)*hface(i,1)%length
@@ -868,7 +872,7 @@ contains
         logical,intent(out)::accepted
         real(KREAL),allocatable::w(:,:,:),h(:,:,:),b(:,:,:),wn(:,:,:),hs(:,:,:),bs(:,:,:)
         real(KREAL)::diag(12),dummy_flux,coll,t0c,t1c,total(4),drift,dx,dy,diag_step
-        real(KREAL)::bottom(4),top(4),balance_next(4),delta(4),world_drift
+        real(KREAL)::bottom(4),top(4),balance_next(4),delta(4),world_drift,xnet(4)
         integer::i,j,k,step,o1unit,side,mpi_e
         logical::ok
         accepted=.false.;if(.not.IsS2CN2())return
@@ -909,7 +913,7 @@ contains
         call cpu_time(t0c);total=0.0_KREAL
         do i=1,4;total(i)=sum(w(i,:,:));enddo
         if(cart_native)total=GlobalSum4(total)
-        if(S2W1_wall_mode==1)then
+        if(S2W1_wall_mode>=1)then
             bottom=0.0_KREAL;top=0.0_KREAL
             do i=1,nx
                 if(ID_Y_minus==MPI_PROC_NULL)bottom=bottom+lower_w(:,i)/dy
@@ -918,7 +922,15 @@ contains
             if(cart_native)then
                 bottom=GlobalSum4(bottom);top=GlobalSum4(top)
             endif
-            balance_next=wall_balance+top-bottom
+            xnet=0.0_KREAL
+            if(S2W1_wall_mode==2)then
+                do j=1,ny
+                    if(ID_X_minus==MPI_PROC_NULL)xnet=xnet-vface(1,j)%L_flux/ctr(1,j)%area
+                    if(ID_X_plus==MPI_PROC_NULL)xnet=xnet+vface(nx+1,j)%R_flux/ctr(nx,j)%area
+                enddo
+                if(cart_native)xnet=GlobalSum4(xnet)
+            endif
+            balance_next=wall_balance+top-bottom+xnet
             drift=maxval(abs(total+balance_next-total0)/max(1.0_KREAL,abs(total0)))
         else
             drift=maxval(abs(total-total0)/max(1.0_KREAL,abs(total0)))
@@ -956,7 +968,7 @@ contains
             flush(gas_unit)
         endif
         if(w1d_diagnostic)call w1d_dump_post(step,w,h,b,diag)
-        if(S2W1_wall_mode==1)then
+        if(S2W1_wall_mode>=1)then
             wall_balance=balance_next;delta=total-total0
             cumulative_bottom=cumulative_bottom+bottom;cumulative_top=cumulative_top+top
             call PublishWallDiagnostics()
@@ -1094,6 +1106,24 @@ contains
                 hface(i,j)%Aerodynamics=[rate(3),-rate(2),rate(4)-S2W1_wall_ux(side)*rate(2)]
             enddo
         enddo
+        if(S2W1_wall_mode==2)then
+            do side=1,2
+                if(side==1.and.ID_X_minus/=MPI_PROC_NULL)cycle
+                if(side==2.and.ID_X_plus/=MPI_PROC_NULL)cycle
+                i=1;if(side==2)i=nx+1
+                do j=1,ny
+                    measure=dt_global*vface(i,j)%length
+                    hh=vface(i,j)%L_flux_h_vec/(measure*uVel)
+                    bb=vface(i,j)%L_flux_b_vec/(measure*uVel)
+                    call moment_2d(hh,bb,uVel,vVel,wVel,ww,ok)
+                    if(.not.ok)call abort_native('vertical wall output moment failed',459)
+                    prim=GetPrimary(ww)
+                    vface(i,j)%FlowVars=[prim(1:3),1.0_KREAL/prim(4),0.5_KREAL*prim(1)/prim(4)]
+                    rate=vface(i,j)%L_flux/measure
+                    vface(i,j)%Aerodynamics=[rate(2),rate(3),rate(4)]
+                enddo
+            enddo
+        endif
     end subroutine
 
     subroutine SaveRejectedAcceptedState(reason,collective)
@@ -1131,7 +1161,7 @@ contains
         open(newunit=fu,file='Simulation_Log.txt',status='old',position='append')
         write(fu,'(A,I0,A,ES24.16)')'Accepted final step=',iter,' physical time=',time_dis
         write(fu,'(A,4ES24.16)')'Accepted macro residual=',res
-        if(S2W1_wall_mode==1)then
+        if(S2W1_wall_mode>=1)then
             write(fu,'(A,4ES24.16)')'Integrated bottom +y flux (mass,mx,my,E)=',area*cumulative_bottom
             write(fu,'(A,4ES24.16)')'Integrated top +y flux (mass,mx,my,E)=',area*cumulative_top
             write(fu,'(A,4ES24.16)')'Integrated outward net wall flux=',area*wall_balance
@@ -1174,7 +1204,7 @@ contains
         if(steps_open.and.iter>=MAX_ITER)then
             close(steps_unit);steps_unit=-1;steps_open=.false.
         endif
-        if(S2W1_wall_mode==1.and.iter>=MAX_ITER.and.(S2Diagnostics.or..not.IsS2CN2()))then
+        if(S2W1_wall_mode>=1.and.iter>=MAX_ITER.and.(S2Diagnostics.or..not.IsS2CN2()))then
             close(wall_unit);close(wall_segment_unit)
             if(S2W1_time_centered==1)close(w1t_cost_unit)
             if(S2W1D_face_time_consistent==1)close(w1d_cost_unit)

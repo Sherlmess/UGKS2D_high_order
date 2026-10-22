@@ -1,6 +1,7 @@
 ! High-order dedicated slab metadata. LAP and legacy paths remain unchanged.
 module mod_S2MPI1Layout
     use Precision, only: KREAL
+    use flow_para, only: S2W1_wall_mode
     use mpi
     implicit none
     real(KREAL)::communication_seconds=0.0_KREAL,communication_clock=0.0_KREAL
@@ -266,16 +267,52 @@ contains
     end function
     integer function xrecon_lo()
         xrecon_lo=xlo()
-        if(cart_context)xrecon_lo=xlo()-1
+        if(cart_context.and..not.left_wall())xrecon_lo=xlo()-1
     end function
     integer function xrecon_hi(n)
         integer,intent(in)::n
         xrecon_hi=xhi(n)
-        if(cart_context)xrecon_hi=xhi(n)+1
+        if(cart_context.and..not.right_wall())xrecon_hi=xhi(n)+1
     end function
     integer function yrecon_lo()
         yrecon_lo=active_lo()
         if(cart_context.and..not.lower_wall())yrecon_lo=active_lo()-1
+    end function
+    logical function cavity_mode()
+        cavity_mode=S2W1_wall_mode==2
+    end function
+    integer function global_i(i)
+        integer,intent(in)::i
+        global_i=i
+        if(cart_context)global_i=cart_oi+i-cart_xlo
+    end function
+    integer function global_nx(n)
+        integer,intent(in)::n
+        global_nx=n
+        if(cart_context)global_nx=cart_nx
+    end function
+    logical function near_x_wall(i,n)
+        integer,intent(in)::i,n
+        near_x_wall=cavity_mode().and.(global_i(i)<=3.or.global_i(i)>=global_nx(n)-2)
+    end function
+    integer function wall_first_x(i,n)
+        integer,intent(in)::i,n
+        wall_first_x=merge(1,n-4,global_i(i)<=3)
+        if(cart_context)wall_first_x=merge(cart_xlo-cart_oi+1,cart_xlo+cart_nx-cart_oi-4,global_i(i)<=3)
+    end function
+    logical function left_wall()
+        left_wall=.false.
+        if(cavity_mode())then
+            left_wall=.true.
+            if(cart_context)left_wall=cart_xminus==MPI_PROC_NULL
+        endif
+    end function
+    logical function right_wall()
+        right_wall=.false.
+        if(cavity_mode())then
+            right_wall=.true.
+            if(cart_context)right_wall=cart_xplus==MPI_PROC_NULL
+        endif
     end function
     integer function wall_first(j,n)
         integer,intent(in)::j,n
@@ -298,6 +335,8 @@ contains
         call MPI_Sendrecv(sp,size(sp),MPI_DOUBLE_PRECISION,cart_xplus,22001,rm,size(rm),MPI_DOUBLE_PRECISION,cart_xminus,22001,MPI_COMM_WORLD,st,e)
         if(cart_xminus/=MPI_PROC_NULL)field(:,1:3,cart_ylo:cart_yhi)=rm
         if(cart_xplus/=MPI_PROC_NULL)field(:,cart_xhi+1:cart_xhi+3,cart_ylo:cart_yhi)=rp
+        if(cart_xminus==MPI_PROC_NULL)field(:,1:3,cart_ylo:cart_yhi)=spread(field(:,cart_xlo,cart_ylo:cart_yhi),2,3)
+        if(cart_xplus==MPI_PROC_NULL)field(:,cart_xhi+1:cart_xhi+3,cart_ylo:cart_yhi)=spread(field(:,cart_xhi,cart_ylo:cart_yhi),2,3)
         deallocate(sm,sp,rm,rp)
         ! Include the freshly exchanged x strips: this supplies all tensor corners.
         allocate(sm(nc,nx+6,3),sp(nc,nx+6,3),rm(nc,nx+6,3),rp(nc,nx+6,3))
@@ -330,6 +369,8 @@ contains
                 rm,size(rm),MPI_DOUBLE_PRECISION,cart_xminus,22201,MPI_COMM_WORLD,st,e)
             if(cart_xminus/=MPI_PROC_NULL)field(:,cart_xlo-k,cart_ylo:cart_yhi)=rm
             if(cart_xplus/=MPI_PROC_NULL)field(:,cart_xhi+k,cart_ylo:cart_yhi)=rp
+            if(cart_xminus==MPI_PROC_NULL)field(:,cart_xlo-k,cart_ylo:cart_yhi)=field(:,cart_xlo,cart_ylo:cart_yhi)
+            if(cart_xplus==MPI_PROC_NULL)field(:,cart_xhi+k,cart_ylo:cart_yhi)=field(:,cart_xhi,cart_ylo:cart_yhi)
         enddo
         deallocate(sm,sp,rm,rp)
         allocate(sm(nc,size(field,2)),sp(nc,size(field,2)),rm(nc,size(field,2)),rp(nc,size(field,2)))

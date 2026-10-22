@@ -278,7 +278,8 @@ contains
             if(.not.ext1.and.S2CartesianMesh.and.IsS2CN2())then
                 do j=1,Ny_all+1;do i=1,Nx_all+1
                     gridx_all(i,j)=real(i-1,KREAL)*(2.0_KREAL*acos(-1.0_KREAL)/real(Nx_all,KREAL))
-                    if(S2W1_wall_mode==1)then
+                    if(S2W1_wall_mode==2)gridx_all(i,j)=real(i-1,KREAL)/real(Nx_all,KREAL)
+                    if(S2W1_wall_mode>=1)then
                         gridy_all(i,j)=real(j-1,KREAL)/real(Ny_all,KREAL)
                     else
                         gridy_all(i,j)=real(j-1,KREAL)*(2.0_KREAL*acos(-1.0_KREAL)/real(Ny_all,KREAL))

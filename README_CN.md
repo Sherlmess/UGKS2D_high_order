@@ -1,3 +1,5 @@
+> **当前标签 v1.2：近壁 2→3→5 方腔版本。** [版本说明与运行方法](RELEASE_v1.2_CN.md)。下文 Couette 说明属于继承版本。
+
 # 当前版本 IO-R3：速度表来源与超算启动修复
 
 先读 [VELOCITY_SOURCE_FIX_CN.md](VELOCITY_SOURCE_FIX_CN.md)。本包以配置的公共外部速度表作为高低阶共同来源，使用srun/pmi2，必须在新目录编译。下文IO-R2/IO-R1为继承说明。

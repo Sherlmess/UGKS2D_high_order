@@ -286,14 +286,14 @@ contains
             tn=Tw
             if(has_theta)tn=2.0_KREAL*S2W1_wall_theta(side)
             if(has_native)tn=S2WallTNative(side)
-            if(S2W1_wall_mode==1)then
+            if(S2W1_wall_mode>=1)then
                 if(.not.ieee_is_finite(tn).or.tn<=0.0_KREAL) &
                     call AbortInvalidImplicitOption('effective S2 wall T_native must be positive and finite')
             elseif(.not.has_theta.and..not.has_native)then
                 tn=2.0_KREAL ! unused legacy periodic defaults
             endif
             S2WallTNative(side)=tn;S2W1_wall_theta(side)=0.5_KREAL*tn
-            if(S2W1_wall_mode==1)write(*,'(A,I0,A,3ES24.16)') &
+            if(S2W1_wall_mode>=1)write(*,'(A,I0,A,3ES24.16)') &
                 'S2 wall side ',side,' T_native, theta, lambda: ',tn,0.5_KREAL*tn,1.0_KREAL/tn
         enddo
     end subroutine ResolveS2WallTemperatures
@@ -390,10 +390,10 @@ contains
                 call AbortInvalidImplicitOption('HighOrderImplicit requires PR2, one micro pair, no retry')
         endif
         if(ClosedCouetteMassRescale)then
-            if(.not.IsImplicitSteady().or.any(BC_Type/=[10,10,2,2]).or.BG_geometry/=0.or. &
+            if(.not.IsImplicitSteady().or.(any(BC_Type/=[10,10,2,2]).and..not.(S2W1_wall_mode==2.and.all(BC_Type==2))).or.BG_geometry/=0.or. &
                 .not.CouetteUseW2BWall.or.FluxWall_type/=1.or.ACC/=1.or.Iflag_DIS/=0.or. &
                 Iflag_Fringe/=0.or.DISBC_Type/=0.or.Implicit_ClosedMassConstraint) &
-                call AbortInvalidImplicitOption('mass rescale only for closed periodic Couette implicit')
+                call AbortInvalidImplicitOption('mass rescale only for closed Couette or cavity implicit')
         endif
         if(S2VelocityScale/=-1.0_KREAL)then
             if(.not.ieee_is_finite(S2VelocityScale).or.S2VelocityScale<=0.0_KREAL) &
@@ -409,7 +409,7 @@ contains
         endif
         if(S2PhysicalGas/=0.and.S2PhysicalGas/=1)call AbortInvalidImplicitOption('S2PhysicalGas must be 0 or 1')
         if(S2PhysicalGas==1.and.(trim(TimeIntegration_method)=='S2CN2'.or.IsHighOrderImplicit()))then
-            if((trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or.(S2W1_wall_mode==1.and.FluxWall_type/=1).or. &
+            if((trim(TimeIntegration_method)/='S2CN2'.and..not.IsHighOrderImplicit()).or.(S2W1_wall_mode>=1.and.FluxWall_type/=1).or. &
                 S2W2R_shared_predictor/=0.or.S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0.or. &
                 all(ck/=[1,3]))call AbortInvalidImplicitOption('physical gas requires W2 type1 single-rank CK1/3')
             if(.not.ieee_is_finite(Pr).or.Pr<=0.0_KREAL.or.Pr>1.0_KREAL.or. &
@@ -526,6 +526,11 @@ contains
                 if(FluxWall_type==FluxWall_Multiscale.and. &
                     (S2W1_time_centered/=0.or.S2W1D_face_time_consistent/=0)) &
                     call AbortInvalidImplicitOption('S2W2 type1 requires centered=0 and face_time_consistent=0')
+            elseif(S2W1_wall_mode==2.and.(trim(TimeIntegration_method)=='S2CN2'.or.IsHighOrderImplicit()))then
+                if(any(BC_Type/=BCconst_wall_isothermal).or.FluxWall_type/=FluxWall_Multiscale.or. &
+                    .not.S2CartesianMesh.or.any(WallUx(1:3)/=0.0_KREAL).or. &
+                    any(S2WallTNative/=Tw).or.S2PhysicalGas/=1) &
+                    call AbortInvalidImplicitOption('cavity requires four equal isothermal type1 walls, stationary sides/bottom and physical gas')
             else
                 call AbortInvalidImplicitOption('S2W1 wall mode is unsupported for this method')
             endif
@@ -533,7 +538,7 @@ contains
             if(.not.IsS2Steady())then
                 ! Native S2 cold/restart initialization is selected by Iflag_InitFlow.
                 continue
-            elseif(S2W1_wall_mode==1)then
+            elseif(S2W1_wall_mode>=1)then
                 if(S2D1_initial_mode/=4.and.S2D1_initial_mode/=5) &
                     call AbortInvalidImplicitOption('S2W1 requires initial mode 4 or 5')
             else
@@ -1140,7 +1145,7 @@ contains
         else
             write(unit_id, '(a)') "================================================================================="
         endif
-        if(S2W1_wall_mode==1)then
+        if(S2W1_wall_mode>=1)then
             write(unit_id,'(A,2ES24.16)')'S2 effective wall T_native: ',S2WallTNative
             write(unit_id,'(A,2ES24.16)')'S2 effective wall theta: ',S2W1_wall_theta
             write(unit_id,'(A,2ES24.16)')'S2 effective wall lambda: ',1.0_KREAL/S2WallTNative

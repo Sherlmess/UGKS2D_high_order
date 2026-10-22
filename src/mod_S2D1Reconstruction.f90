@@ -1,12 +1,14 @@
 module mod_S2D1Reconstruction
     use mod_S2MPI1Layout
     use Precision, only: KREAL
+    use const_para, only: SMV
+    use mod_Interpolation, only: native_vanleer_slope
     use, intrinsic :: ieee_arithmetic, only: ieee_is_finite
     implicit none
     private
     public :: s2d1_face3, s2d1_side3, s2d1_cell9, s2d1_weno1d, s2d1_cell_faces9
     public :: FirstLayerPlane,prepare_first_layer_plane,s2d1_cell_faces9_cached,first_layer_plane_bytes
-    public :: s2d1_cell_faces9_wall
+    public :: s2d1_cell_faces9_wall, s2d1_cell_faces9_cavity
     public :: VelocityTileWorkspace,VT_VELOCITIES,prepare_velocity_tile,reconstruct_velocity_tile_cell
 
     real(KREAL), parameter :: eps_weno=1.0e-8_KREAL
@@ -16,6 +18,9 @@ module mod_S2D1Reconstruction
     real(KREAL), save :: cmap(0:4,5,4)=0.0_KREAL
     real(KREAL), save :: wallmap(0:4,5,3,2)=0.0_KREAL
     logical, save :: maps_ready=.false.
+    public :: s2d1_graded_axis_probe
+    logical, save :: graded_flag_read=.false.,graded_flag=.false.
+    logical, save :: vl_flag_read=.false.,vl_flag=.false.
     real(KREAL), save :: fixed_pow(8,0:4),fixed_dpow(8,0:4)
 
     ! Owned by one field and one velocity node during a single compute_flux.
@@ -48,6 +53,89 @@ module mod_S2D1Reconstruction
     end type
 
 contains
+
+    logical function near_wall_vl_enabled()
+        character(len=16)::v
+        integer::status
+        if(.not.vl_flag_read)then
+            call get_environment_variable('S2_NEAR_WALL_VL',v,status=status)
+            vl_flag=status==0.and.trim(v)=='1';vl_flag_read=.true.
+        endif
+        near_wall_vl_enabled=vl_flag.and.cavity_mode()
+    end function
+
+    logical function near_wall_graded_enabled()
+        character(len=16)::v
+        integer::status
+        if(.not.graded_flag_read)then
+            call get_environment_variable('S2_NEAR_WALL_GRADED235',v,status=status)
+            graded_flag=status==0.and.trim(v)=='1';graded_flag_read=.true.
+        endif
+        near_wall_graded_enabled=graded_flag.and.cavity_mode()
+    end function
+
+    logical function near_wall_limited_enabled()
+        near_wall_limited_enabled=near_wall_vl_enabled().or.near_wall_graded_enabled()
+    end function
+
+    ! GKScode WENO3-Z endpoint weights on three FV cell averages.
+    ! Match both endpoints AND the target mean with one quadratic so that
+    ! face derivatives and GQ3 values belong to the same reconstruction.
+    subroutine nearwall_weno3(q,comp,g,n,xi,value,deriv,cvalue)
+        real(KREAL),intent(in)::q(5),comp(5),xi(5)
+        integer,intent(in)::g,n
+        real(KREAL),intent(out)::value(5),deriv(5),cvalue(3)
+        real(KREAL)::dl,dr,beta(2),tau,fac(2),wl(2),wr(2),lv,rv,c1,c2
+        real(KREAL)::cl,cr,lc,rc,cc1,cc2
+        integer::c
+        c=merge(2,4,g<=3)
+        dl=q(c)-q(c-1);dr=q(c+1)-q(c)
+        beta=[dl*dl,dr*dr];tau=abs(beta(1)-beta(2))
+        fac=1.0_KREAL+(tau/(beta+eps_weno))**2
+        wl=[2.0_KREAL/3.0_KREAL,1.0_KREAL/3.0_KREAL]*fac
+        wr=[1.0_KREAL/3.0_KREAL,2.0_KREAL/3.0_KREAL]*fac
+        wl=wl/sum(wl);wr=wr/sum(wr)
+        lv=-0.5_KREAL*(wl(1)*dl+wl(2)*dr)
+        rv= 0.5_KREAL*(wr(1)*dl+wr(2)*dr)
+        c1=rv-lv;c2=3.0_KREAL*(rv+lv)
+        value=q(c)+c1*xi+c2*(xi*xi-1.0_KREAL/12.0_KREAL)
+        deriv=c1+2.0_KREAL*c2*xi
+        ! Existing tensor companion convention: freeze the primary weights.
+        cl=comp(c)-comp(c-1);cr=comp(c+1)-comp(c)
+        lc=-0.5_KREAL*(wl(1)*cl+wl(2)*cr)
+        rc= 0.5_KREAL*(wr(1)*cl+wr(2)*cr)
+        cc1=rc-lc;cc2=3.0_KREAL*(rc+lc)
+        cvalue=comp(c)+cc1*gnode+cc2*(gnode*gnode-1.0_KREAL/12.0_KREAL)
+    end subroutine
+
+    subroutine s2d1_graded_axis_probe(q,comp,g,n,value,deriv,cvalue,ok)
+        real(KREAL),intent(in)::q(5),comp(5)
+        integer,intent(in)::g,n
+        real(KREAL),intent(out)::value(5),deriv(5),cvalue(3)
+        logical,intent(out)::ok
+        call cavity_axis(q,comp,g,n,min(g,n-g+1)<=3,value,deriv,cvalue,ok)
+    end subroutine
+
+    ! Physical-wall directions only. No ghost state or wall law is changed.
+    ! The first/last cell uses the two inward differences; cells 2/3 use
+    ! their immediate neighbours. Keep the original cell average.
+    subroutine nearwall_linear(q,comp,g,n,xi,value,deriv,cvalue)
+        real(KREAL),intent(in)::q(5),comp(5),xi(5)
+        integer,intent(in)::g,n
+        real(KREAL),intent(out)::value(5),deriv(5),cvalue(3)
+        real(KREAL)::sl,sr,s,cl,cr,cs,wl,wr,den
+        integer::c,l,r
+        c=merge(g,5-(n-g),g<=3);l=max(1,min(3,c-1));r=l+2
+        sl=q(l+1)-q(l);sr=q(r)-q(r-1)
+        cl=comp(l+1)-comp(l);cr=comp(r)-comp(r-1)
+        s=native_vanleer_slope(sl,sr)
+        wl=0;wr=0
+        if((sl>0.and.sr>0).or.(sl<0.and.sr<0))then
+            den=abs(sl)+abs(sr)+SMV;wl=abs(sr)/den;wr=abs(sl)/den
+        endif
+        cs=wl*cl+wr*cr
+        value=q(c)+s*xi;deriv=s;cvalue=comp(c)+cs*gnode
+    end subroutine
 
     integer pure function ip(i,n)
         integer, intent(in) :: i,n
@@ -143,6 +231,89 @@ contains
         first=wall_first(j,size(field,2))
         do s=1,5;q(s)=field(i,first+s-1);enddo
     end subroutine wall_samples
+
+
+    ! Cavity side-wall extension. At corners BOTH axes use five physical
+    ! cell averages. No physical ghost value enters this reconstruction.
+    subroutine cavity_axis(q,comp,g,n,onesided,value,deriv,cvalue,ok)
+        real(KREAL),intent(in)::q(5),comp(5)
+        integer,intent(in)::g,n
+        logical,intent(in)::onesided
+        real(KREAL),intent(out)::value(5),deriv(5),cvalue(3)
+        logical,intent(out)::ok
+        real(KREAL)::coef(0:4),cc(0:4),fw(4),wc(0:4,4),dummy(3),dummy2(3),xi(5)
+        integer::a,d,side,dist
+        call init_maps();xi=[-0.5_KREAL,0.5_KREAL,gnode]
+        if(onesided.and.near_wall_graded_enabled())then
+            dist=min(g,n-g+1)
+            if(dist==1)then
+                call nearwall_linear(q,comp,g,n,xi,value,deriv,cvalue)
+            elseif(dist==2)then
+                call nearwall_weno3(q,comp,g,n,xi,value,deriv,cvalue)
+            else
+                ! At layer 3 the five physical cells are centered on the target.
+                call weno_coefficients(q,fw,wc,ok);if(.not.ok)return
+                do a=1,5
+                    call prepared_eval(fw,wc,xi(a),value(a),deriv(a),ok);if(.not.ok)return
+                enddo
+                call companion_eval3(q,comp,dummy,dummy2,cvalue,ok);if(.not.ok)return
+            endif
+        else if(onesided.and.near_wall_vl_enabled())then
+            call nearwall_linear(q,comp,g,n,xi,value,deriv,cvalue)
+        else if(onesided)then
+            side=merge(1,2,g<=3);dist=merge(g,n-g+1,g<=3)
+            coef=matmul(wallmap(:,:,dist,side),q);cc=matmul(wallmap(:,:,dist,side),comp)
+            do a=1,5
+                value(a)=coef(4);deriv(a)=4.0_KREAL*coef(4)
+                do d=3,0,-1;value(a)=value(a)*xi(a)+coef(d);enddo
+                do d=3,1,-1;deriv(a)=deriv(a)*xi(a)+real(d,KREAL)*coef(d);enddo
+            enddo
+            do a=1,3
+                cvalue(a)=cc(4)
+                do d=3,0,-1;cvalue(a)=cvalue(a)*gnode(a)+cc(d);enddo
+            enddo
+        else
+            call weno_coefficients(q,fw,wc,ok);if(.not.ok)return
+            do a=1,5
+                call prepared_eval(fw,wc,xi(a),value(a),deriv(a),ok);if(.not.ok)return
+            enddo
+            call companion_eval3(q,comp,dummy,dummy2,cvalue,ok);if(.not.ok)return
+        endif
+        ok=all(ieee_is_finite(value)).and.all(ieee_is_finite(deriv)).and.all(ieee_is_finite(cvalue))
+    end subroutine
+
+    subroutine s2d1_cell_faces9_cavity(field,i,j,face,dn,dt,volume,ok)
+        real(KREAL),intent(in)::field(:,:)
+        integer,intent(in)::i,j
+        real(KREAL),intent(out)::face(4,3),dn(4,3),dt(4,3),volume(3,3)
+        logical,intent(out)::ok
+        integer::nx,ny,ix(5),jy(5),r,s,a
+        real(KREAL)::xv(5,5),xd(5,5),yv(5,5),yd(5,5),q(5),val(5),der(5),cv(3),zero(5)
+        logical::wx,wy
+        nx=size(field,1);ny=size(field,2);wx=near_x_wall(i,nx);wy=near_wall(j,ny);zero=0
+        do s=1,5
+            ix(s)=ip(i+s-3,nx);jy(s)=ip(j+s-3,ny)
+            if(wx)ix(s)=wall_first_x(i,nx)+s-1
+            if(wy)jy(s)=wall_first(j,ny)+s-1
+        enddo
+        do r=1,5
+            q=field(ix,jy(r))
+            call cavity_axis(q,zero,global_i(i),global_nx(nx),wx,xv(r,:),xd(r,:),cv,ok);if(.not.ok)return
+            q=field(ix(r),jy)
+            call cavity_axis(q,zero,global_j(j),global_ny(ny),wy,yv(r,:),yd(r,:),cv,ok);if(.not.ok)return
+        enddo
+        do s=1,2
+            call cavity_axis(xv(:,s),xd(:,s),global_j(j),global_ny(ny),wy,val,der,cv,ok);if(.not.ok)return
+            face(s,:)=val(3:5);dt(s,:)=der(3:5);dn(s,:)=cv
+            call cavity_axis(yv(:,s),yd(:,s),global_i(i),global_nx(nx),wx,val,der,cv,ok);if(.not.ok)return
+            face(s+2,:)=val(3:5);dt(s+2,:)=der(3:5);dn(s+2,:)=cv
+        enddo
+        do a=1,3
+            call cavity_axis(xv(:,a+2),zero,global_j(j),global_ny(ny),wy,val,der,cv,ok);if(.not.ok)return
+            volume(a,:)=val(3:5)
+        enddo
+        ok=.true.
+    end subroutine
 
     subroutine solve_small(a,b,x)
         real(KREAL), intent(in) :: a(:,:),b(:)
@@ -337,6 +508,12 @@ contains
         logical :: lok
         nx=size(field,1);ny=size(field,2);ok=.false.
         j=merge(tangent,cell,axis==1)
+        if(near_x_wall(merge(cell,tangent,axis==1),nx))then
+            call s2d1_cell_faces9_cavity(field,merge(cell,tangent,axis==1),j,f,n,t,vol,ok)
+            slot=merge(merge(1,2,side<0.0_KREAL),merge(3,4,side<0.0_KREAL),axis==1)
+            if(ok)then;value=f(slot,:);dn=n(slot,:);dt=t(slot,:);endif
+            return
+        endif
         if(present(wall_y))then
             if(wall_y.and.near_wall(j,ny))then
                 if(axis==1)then
@@ -387,6 +564,9 @@ contains
         integer :: r,s,a,b,nx,ny
         logical :: lok
         nx=size(field,1);ny=size(field,2);ok=.false.
+        if(near_x_wall(i,nx))then
+            call s2d1_cell_faces9_cavity(field,i,j,face,dn,dt,value,ok);return
+        endif
         if(present(wall_y))then
             if(wall_y.and.near_wall(j,ny))then
                 call s2d1_cell_faces9_wall(field,i,j,face,dn,dt,value,ok)
@@ -463,6 +643,11 @@ contains
         integer::r,s,a,b,nx,ny,first
         logical::lok
         nx=size(field,1);ny=size(field,2);ok=.false.
+        ! Match the cached/velocity-tile cavity dispatch on x walls and corners.
+        if(near_x_wall(i,nx).or.(near_wall_limited_enabled().and.near_wall(j,ny)))then
+            call s2d1_cell_faces9_cavity(field,i,j,face,dn,dt,volume,ok)
+            return
+        endif
         if(ny<5.or.j<1.or.j>ny)return
         if(.not.near_wall(j,ny))then
             call s2d1_cell_faces9(field,i,j,face,dn,dt,volume,ok)
@@ -684,6 +869,11 @@ contains
             if(i<cache%targets(1).or.i>cache%targets(2).or. &
                j<cache%targets(3).or.j>cache%targets(4))return
         endif
+        if(present(field))then
+            if(near_x_wall(i,cache%nx))then
+                call s2d1_cell_faces9_cavity(field,i,j,face,dn,dt,volume,ok);return
+            endif
+        endif
         if(present(wall_y).and.present(field))then
             if(wall_y.and.near_wall(j,cache%ny))then
                 call s2d1_cell_faces9_wall(field,i,j,face,dn,dt,volume,ok)
@@ -824,6 +1014,18 @@ contains
         nx=ws%cache(1)%nx;ny=ws%cache(1)%ny
         if(i<ws%cache(1)%targets(1).or.i>ws%cache(1)%targets(2).or. &
            j<ws%cache(1)%targets(3).or.j>ws%cache(1)%targets(4))return
+        if(near_x_wall(i,nx).or.(wall.and.near_wall_limited_enabled().and.near_wall(j,ny)))then
+            do f=1,ws%nf
+                k=k0+(f-1)/2
+                if(mod(f,2)==1)then
+                    call s2d1_cell_faces9_cavity(h(:,:,k),i,j,ws%face(:,:,f),ws%dn(:,:,f),ws%dt(:,:,f),ws%vol(:,:,f),ok)
+                else
+                    call s2d1_cell_faces9_cavity(b(:,:,k),i,j,ws%face(:,:,f),ws%dn(:,:,f),ws%dt(:,:,f),ws%vol(:,:,f),ok)
+                endif
+                if(.not.ok)return
+            enddo
+            return
+        endif
         if(wall.and.near_wall(j,ny))then
             if(ws%wall_batch)then
                 call reconstruct_wall_tile(ws,i,j,ok)

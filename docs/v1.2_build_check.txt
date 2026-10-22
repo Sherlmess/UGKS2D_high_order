@@ -1,0 +1,9 @@
+v1.2 release verification, 2026-10-22
+
+GNU Fortran (Homebrew GCC 15.2.0) 15.2.0
+make release: exit 0 (clean GNU Fortran/MPI release build)
+bash -n run_graded235.sh: exit 0
+All source files and Makefile byte-identical to validated R23 and R25 graded code.
+No new numerical trajectory executed. Existing N16/N32 validation cited in RELEASE_v1.2_CN.md.
+One inherited trailing space in mod_ImplicitMacro.f90 diagnostic retained to preserve source identity.
+Historical provenance/ and checks/ describe their original snapshots, not new validation.

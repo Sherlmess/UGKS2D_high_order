@@ -22,6 +22,11 @@ module mod_Interpolation
     !--------------------------------------------------
     
     contains
+
+    pure elemental real(KREAL) function native_vanleer_slope(sL,sR) result(s)
+        real(KREAL),intent(in)::sL,sR
+        s=(sign(UP,sR)+sign(UP,sL))*abs(sR)*abs(sL)/(abs(sR)+abs(sL)+SMV)
+    end function
     
     subroutine Interpolation()
         integer(KINT)                                   :: i,j
@@ -156,17 +161,17 @@ module mod_Interpolation
         do k=1,Nvel
             sL = (targetCell%h_vec(k)-leftCell%h_vec(k))/denomL
             sR = (rightCell%h_vec(k)-targetCell%h_vec(k))/denomR
-            targetCell%sh_vec(k,idx) = (sign(UP,sR)+sign(UP,sL))*abs(sR)*abs(sL)/(abs(sR)+abs(sL)+SMV)
+            targetCell%sh_vec(k,idx) = native_vanleer_slope(sL,sR)
 
             sL = (targetCell%b_vec(k)-leftCell%b_vec(k))/denomL
             sR = (rightCell%b_vec(k)-targetCell%b_vec(k))/denomR
-            targetCell%sb_vec(k,idx) = (sign(UP,sR)+sign(UP,sL))*abs(sR)*abs(sL)/(abs(sR)+abs(sL)+SMV)
+            targetCell%sb_vec(k,idx) = native_vanleer_slope(sL,sR)
         end do
         
         !>Macro conservative variables
         sLw = (targetCell%conVars-leftCell%conVars)/denomL
         sRw = (rightCell%conVars-targetCell%conVars)/denomR
-        targetCell%sw(:,idx) = (sign(UP,sRw)+sign(UP,sLw))*abs(sRw)*abs(sLw)/(abs(sRw)+abs(sLw)+SMV)
+        targetCell%sw(:,idx) = native_vanleer_slope(sLw,sRw)
     end subroutine Interp_VanLeer
     
 end module mod_Interpolation

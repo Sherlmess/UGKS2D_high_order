@@ -24,11 +24,11 @@ contains
             call S2NativeWriteOutput()
             return
         endif
-        if(IsS2CN2().and.UnifiedPhysicalOperators.and.S2W1_wall_mode==1)call S2NativePublishWallDiagnostics()
+        if(IsS2CN2().and.UnifiedPhysicalOperators.and.S2W1_wall_mode>=1)call S2NativePublishWallDiagnostics()
         if(Iflag_WriteSurf==1)      call write_wallboundary
         call write_flow
         if(IsS2CN2().and..not.IsHighOrderImplicit())then
-            if(Iflag_WriteSurf==1.and.S2W1_wall_mode==1)call write_wallboundary(2)
+            if(Iflag_WriteSurf==1.and.S2W1_wall_mode>=1)call write_wallboundary(2)
             if(S2Diagnostics)call S2NativeWriteOutput()
             call S2NativeRunSummary()
         endif

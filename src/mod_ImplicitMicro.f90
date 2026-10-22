@@ -25,6 +25,7 @@ module mod_ImplicitMicro
     public :: GetMicroFaceValue
     public :: EvaluateMicroPointBreakdown
     public :: EvaluatePredictedEquilibriumBreakdown, WeightedNegativeFraction
+    public :: DumpCornerMicroDefect
     public :: PrepareFrozenMicroWallState
 contains
     pure real(KREAL) function WeightedNegativeFraction(distribution,weights) result(fraction)
@@ -611,6 +612,46 @@ contains
         defect=rhs-lhs
     end function EvaluateMicroDefectComponent
 
+    ! Research observation only. Refresh correction halos for the complete equation,
+    ! then restore every entry; no additional relaxation or accepted-state change.
+    subroutine DumpCornerMicroDefect()
+        real(KREAL),allocatable::saveh(:,:,:),saveb(:,:,:)
+        real(KREAL)::dtp,rh,rb,lh,lb,un,fl,nh,nb,shift_h,shift_b
+        integer::fu,i,j,k,n,pass
+        logical::ok
+        character(len=80)::filename
+        type(FrozenMicroWallState)::ws
+        allocate(saveh,source=delta_h);allocate(saveb,source=delta_b)
+        do pass=1,2
+            if(pass==2)call MPIExchangeDeltaMicro(delta_h,delta_b)
+            write(filename,'(a,i0,a,i0,a)')'micro_defect_p',pass,'_rank',myID,'.bin'
+            open(newunit=fu,file=trim(filename),status='new',access='stream',form='unformatted')
+            write(fu)nx,ny,Nvel,Block_XY(myID)%Origin_I,Block_XY(myID)%Origin_J
+            do j=1,ny;do i=1,nx
+                dtp=PseudoTimeStep(ctr(i,j)%dt_local,implicit_ncfl_active,CFL)
+                call PrepareFrozenMicroWallState(i,j,ws,ok)
+                if(.not.ok)error stop 'diagnostic wall failure'
+                write(fu)dtp,tau_tilde(i,j)
+                do k=1,Nvel
+                    shift_h=(equilibrium_h(k,i,j)-ctr(i,j)%h_vec(k))/tau_tilde(i,j)-low_collision_old_h(k,i,j)
+                    shift_b=(equilibrium_b(k,i,j)-ctr(i,j)%b_vec(k))/tau_tilde(i,j)-low_collision_old_b(k,i,j)
+                    rh=stream_h(k,i,j)+physical_collision_h(k,i,j)+shift_h
+                    rb=stream_b(k,i,j)+physical_collision_b(k,i,j)+shift_b
+                    lh=delta_h(k,i,j)*(1.0_KREAL/dtp+1.0_KREAL/tau_tilde(i,j))
+                    lb=delta_b(k,i,j)*(1.0_KREAL/dtp+1.0_KREAL/tau_tilde(i,j))
+                    do n=1,4
+                        call GetMicroFaceValue(i,j,k,n,un,fl,nh,nb,ok,ws)
+                        if(.not.ok)error stop 'diagnostic micro face failure'
+                        lh=lh+fl*(max(un,0.0_KREAL)*delta_h(k,i,j)+min(un,0.0_KREAL)*nh)/ctr(i,j)%area
+                        lb=lb+fl*(max(un,0.0_KREAL)*delta_b(k,i,j)+min(un,0.0_KREAL)*nb)/ctr(i,j)%area
+                    enddo
+                    write(fu)delta_h(k,i,j),delta_b(k,i,j),rh,rb,lh,lb,rh-lh,rb-lb,shift_h,shift_b
+                enddo
+            enddo;enddo
+            close(fu)
+        enddo
+        delta_h=saveh;delta_b=saveb
+    end subroutine DumpCornerMicroDefect
     subroutine ComputeMicroDefectNorm(norm_h,norm_b)
         real(KREAL), intent(out) :: norm_h,norm_b
         integer(KINT) :: i,j,k

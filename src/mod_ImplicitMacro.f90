@@ -10,6 +10,7 @@ module mod_ImplicitMacro
     implicit none
     private
     public :: SolveMacroPR2, ComputeMacroDefectNorm, BuildPredictedMacroState
+    public :: DumpCornerMacroDefect
     public :: ImplicitSpectralRadius
 contains
     real(KREAL) function ImplicitSpectralRadius(i,j,dirc,side) result(gamma_face)
@@ -155,6 +156,38 @@ contains
             defect_norm=huge(1.0_KREAL)
         endif
     end function ComputeMacroDefectNorm
+    subroutine DumpCornerMacroDefect()
+        integer(KINT) :: i,j,face_number,fu
+        character(len=80)::filename
+        real(KREAL) :: delta_t_sum(4),delta_neighbor(4),approximate_lhs(4),defect(4)
+        real(KREAL) :: gamma_face,face_length,dt_pseudo,local_sum,global_sum
+        logical :: face_ok,local_ok,global_ok
+
+        write(filename,'(a,i0,a)')'macro_defect_rank',myID,'.bin'
+        open(newunit=fu,file=trim(filename),status='new',access='stream',form='unformatted')
+        write(fu)nx,ny,Block_XY(myID)%Origin_I,Block_XY(myID)%Origin_J
+        local_sum=0.0_KREAL; local_ok=.true.
+        do j=1,ny
+            do i=1,nx
+                dt_pseudo=PseudoTimeStep(ctr(i,j)%dt_local,implicit_ncfl_active,CFL)
+                approximate_lhs=delta_w(:,i,j)/dt_pseudo
+                do face_number=1,4
+                    call GetMacroFaceTerms(i,j,face_number,delta_t_sum,gamma_face, &
+                                           delta_neighbor,face_length,face_ok)
+                    if (.not.face_ok) then
+                        local_ok=.false.
+                        cycle
+                    endif
+                    approximate_lhs=approximate_lhs+0.5_KREAL*face_length* &
+                        (delta_t_sum+gamma_face*(delta_w(:,i,j)-delta_neighbor))/ctr(i,j)%area
+                enddo
+                defect=rate_w(:,i,j)-approximate_lhs
+                write(fu)dt_pseudo,rate_w(:,i,j),delta_w(:,i,j),w_tilde(:,i,j),defect
+                if(.not.local_ok)error stop 'diagnostic macro face failure' 
+            enddo
+        enddo
+        close(fu)
+    end subroutine DumpCornerMacroDefect
 
     subroutine BuildPredictedMacroState(alpha,ok)
         real(KREAL), intent(out) :: alpha

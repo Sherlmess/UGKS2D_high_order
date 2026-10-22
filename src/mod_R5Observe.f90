@@ -249,7 +249,7 @@ contains
         logical,intent(inout) :: ok
         logical :: local,global
         local=ok .and. implicit_alpha==1.0_KREAL .and. r5_macro_alpha==1.0_KREAL .and. &
-            implicit_ncfl_active==1000.0_KREAL .and. implicit_retry_count==0 .and. &
+            implicit_ncfl_active==Implicit_nCFL .and. implicit_retry_count==0 .and. &
             r4_forward_scans-old_forward==1 .and. r4_backward_scans-old_backward==1
         call MPI_Allreduce(local,global,1,MPI_LOGICAL,MPI_LAND,MPI_COMM_WORLD,ierr)
         ok=global
@@ -359,8 +359,8 @@ contains
 
     subroutine WriteProfilesAndWalls()
         real(KREAL) :: prim(4),q(2),stress,fw(4),shear,heat,begin_io
-        real(KREAL) :: local(10,2),global(10,2)
-        integer :: i,j,unit,wall
+        real(KREAL) :: local(10,4),global(10,4)
+        integer :: i,j,unit,wall,nwalls
         character(len=96) :: name
         begin_io=MPI_Wtime()
         if(Nstep_audit>0.and.(mod(profile_state,max(1,Nstep_audit))==0.or.profile_force))then
@@ -393,13 +393,31 @@ contains
                 local(7:9,2)=local(7:9,2)+hface(i,ny+1)%Aerodynamics*hface(i,ny+1)%length
             endif
         enddo
-        call MPI_Allreduce(local,global,20,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
+        nwalls=2
+        if(S2W1_wall_mode==2)then
+            nwalls=4
+            do j=1,ny
+                if(IP_X==0)then
+                    fw=-vface(1,j)%L_flux/ctr(1,j)%dt_local
+                    local(1:4,3)=local(1:4,3)+fw;local(5,3)=local(5,3)+vface(1,j)%length
+                    local(6,3)=local(6,3)+fw(4)
+                    local(7:9,3)=local(7:9,3)+vface(1,j)%Aerodynamics*vface(1,j)%length
+                endif
+                if(IP_X==NP_X-1)then
+                    fw=vface(nx+1,j)%R_flux/ctr(nx,j)%dt_local
+                    local(1:4,4)=local(1:4,4)+fw;local(5,4)=local(5,4)+vface(nx+1,j)%length
+                    local(6,4)=local(6,4)+fw(4)
+                    local(7:9,4)=local(7:9,4)+vface(nx+1,j)%Aerodynamics*vface(nx+1,j)%length
+                endif
+            enddo
+        endif
+        call MPI_Allreduce(local,global,40,MPI_KREAL,MPI_SUM,MPI_COMM_WORLD,ierr)
         if (myID==0) then
             open(newunit=unit,file='wall_history.csv',status='unknown',position='append')
             if (.not.wall_output_initialized) write(unit,'(a)') 'cumulative_state,wall,out_mass,out_Px,out_Py,out_E,length,out_heat,shear_per_length,heat_per_length,native_pnn,native_pnt,native_qn'
-            do wall=1,2
+            do wall=1,nwalls
                 write(unit,'(2(i0,","))',advance='no') profile_state,wall
-                write(unit,'(*(es25.16e3,:,","))') global(1:6,wall),global(2,wall)/global(5,wall), &
+                write(unit,'(*(es25.16e3,:,","))') global(1:6,wall),global(merge(2,3,wall<=2),wall)/global(5,wall), &
                     global(6,wall)/global(5,wall),global(7:9,wall)/global(5,wall)
             enddo
             close(unit)

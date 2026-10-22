@@ -89,7 +89,8 @@ contains
             call CollectiveRequire(Block_XY(r)%NI>=1.and.Block_XY(r)%NJ>=1,'empty Cartesian block',470)
             if(Block_XY(r)%NI<3.or.Block_XY(r)%NJ<3)cart_forward_halo=.true.
             ! A wall cell may need the fifth physical row across several ranks.
-            if(S2W1_wall_mode==1.and.Block_XY(r)%NJ==1)cart_halo=4
+            if(S2W1_wall_mode>=1.and.Block_XY(r)%NJ==1)cart_halo=4
+            if(S2W1_wall_mode==2.and.Block_XY(r)%NI==1)cart_halo=4
         enddo
         if(cart_halo==4)cart_forward_halo=.true.
         if(myID==0)spacing=ctr(1,1)%length
@@ -299,7 +300,8 @@ contains
         cart_context=.true.;call exchange_cart(f);cart_context=.false.;error=0
         do j=1,ny+2*cart_halo;do i=1,nx+2*cart_halo
             gi=modulo(cart_oi+i-cart_xlo-1,Nx_all)+1;gj=modulo(cart_oj+j-cart_ylo-1,Ny_all)+1
-            if(S2W1_wall_mode==1.and.(cart_oj+j-cart_ylo<1.or.cart_oj+j-cart_ylo>Ny_all))cycle
+            if(S2W1_wall_mode>=1.and.(cart_oj+j-cart_ylo<1.or.cart_oj+j-cart_ylo>Ny_all))cycle
+            if(S2W1_wall_mode==2.and.(cart_oi+i-cart_xlo<1.or.cart_oi+i-cart_xlo>Nx_all))cycle
             do k=1,4+2*Nvel
                 expected=real(k+10000*gi+1000000*gj,KREAL);error=max(error,abs(f(k,i,j)-expected))
             enddo
